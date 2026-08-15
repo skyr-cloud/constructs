@@ -69,6 +69,7 @@ export type IngressOptions<TFrontend> {
 }
 
 export type Ingress<TFrontend> {
+	addresses: [{ ipv4: Str?, ipv6: Str }],
 	Rule: fn(RuleOptions<TFrontend>) Rule<TFrontend>,
 }
 
@@ -529,7 +530,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 			rules,
 		}),
 	);
-	Rollout.ReplicaSet({
+	let rs = Rollout.ReplicaSet({
 		name: opts.name,
 		count: opts.replicas,
 		maxSurge: opts.maxSurge,
@@ -544,6 +545,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 			}),
 	});
 	{
+		addresses: rs.replicas,
 		Rule: fn(ruleOpts)
 			switch opts.frontends[ruleOpts.frontend]
 				case nil: raise InvalidRule("rule references unknown frontend {ruleOpts.frontend}")
