@@ -62,10 +62,11 @@ export type IngressOptions<TFrontend> {
 	},
 	timeouts: Timeouts?,
 	frontends: #{TFrontend: FrontendOptions},
-	networks: #{Str: Container.Network}?,
+	networkCidr: Str?,
 }
 
 export type Ingress<TFrontend> {
+	network: Container.Network,
 	addresses: [{ ipv4: Str?, ipv6: Str }],
 	Rule: fn(RuleOptions<TFrontend>) Rule<TFrontend>,
 }
@@ -527,6 +528,10 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 			rules,
 		}),
 	);
+	let network = Container.Network({
+		name: opts.name,
+		cidr: opts.networkCidr ?? "192.168.42.0/24",
+	});
 	let addresses = [
 		for (i in List.range(opts.replicas))
 			proxy.Pod({
@@ -534,11 +539,12 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 				region: opts.region,
 				cpu: opts.replica.cpu,
 				memory: opts.replica.memory,
-				networks: opts.networks,
+				networks: #{ "ing0": network },
 			}),
 	];
 	{
 		addresses,
+		network,
 		Rule: fn(ruleOpts)
 			switch opts.frontends[ruleOpts.frontend]
 				case nil: raise InvalidRule("rule references unknown frontend {ruleOpts.frontend}")
