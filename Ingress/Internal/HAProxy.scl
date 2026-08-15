@@ -47,6 +47,15 @@ let formatStatement: fn(ConfigStatement) Str = fn(stmt)
 	else
 		line
 
+/// The TLS material one terminating bind needs. The chain is public, so it
+/// travels as PEM text; the key stays a Secret Version QID, whose plaintext is
+/// resolved inside the platform when a pod materializes and never enters this
+/// program.
+export type Certificate {
+	certificatePem: Str,
+	privateKeyQid: Str,
+}
+
 export type Config {
 	version: Str,
 	extraSections: [ConfigSection]?,
@@ -57,7 +66,26 @@ export type Config {
 		statements: [ConfigStatement]?,
 	}},
 	backends: #{Str: [ConfigStatement]},
+	/// Certificates to deliver to the pods, keyed by the name a `bind`'s `crt`
+	/// argument refers to them by (see `certificatePath`).
+	certificates: #{Str: Certificate}?,
 }
+
+/// Where the config volume — which carries the certificates too — is mounted.
+let configMountPath = "/usr/local/etc/haproxy"
+
+/// The uid and gid the official `haproxy` image drops to (`USER haproxy`). A
+/// volume seeded from a `.secret` is mounted owner-only, so the mount has to
+/// name this identity or HAProxy cannot read what it was given.
+let haproxyUser = 99
+
+/// A certificate's path within the config volume.
+let certificateFile = fn(name: Str) "tls/{name}.pem"
+
+/// The path a `bind ... ssl crt` argument names certificate `name` by. The
+/// private key is not in this file: HAProxy loads it from the `.key` beside
+/// it, which is how a key that never enters SCL still reaches the same bind.
+export let certificatePath = fn(name: Str) "{configMountPath}/{certificateFile(name)}"
 
 export type PodOptions {
 	name: Str,
@@ -101,9 +129,20 @@ export let configSections: fn(Config) [ConfigSection] = fn(config)
 
 export let Proxy = fn(config: Config)
 	let formattedConfig = formatConfig({ sections: configSections(config) });
+	let certificates = config.certificates ?? #{};
+	let terminatesTls = !Dict.isEmpty(certificates);
+	// One volume, so a rotated key or a rewritten config reaches the pods the
+	// same way. It is mounted writable (below), which is what makes either
+	// change recreate the replicas — HAProxy reads its config and loads its
+	// certificates once, at startup, so a live re-projection would leave the
+	// running process serving the old material.
 	let configVolume = C.ephemeralVolume({
 		files: #{
 			"haproxy.cfg": .literal(formattedConfig),
+			for (e in Dict.entries(certificates))
+				certificateFile(e.key): .literal(e.value.certificatePem),
+			for (e in Dict.entries(certificates))
+				"{certificateFile(e.key)}.key": .secret(e.value.privateKeyQid),
 		},
 	});
 	let image = "haproxy:{config.version}-alpine";
@@ -126,8 +165,16 @@ export let Proxy = fn(config: Config)
 						cpu: opts.cpu,
 						memory: opts.memory,
 						mounts: #{
-							"/usr/local/etc/haproxy": {
+							configMountPath: {
 								volume: configVolume,
+								// A volume seeded from a `.secret` is mounted
+								// owner-only, so once a certificate is in
+								// there the mount has to name the identity the
+								// image runs as — otherwise HAProxy can read
+								// neither its key nor, since one volume is one
+								// directory, its own config.
+								userId: if (terminatesTls) haproxyUser,
+								groupId: if (terminatesTls) haproxyUser,
 							},
 						},
 					},
