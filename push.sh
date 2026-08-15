@@ -29,7 +29,7 @@ remoteurl="$SKYR_USERNAME@skyr.foo:Constructs/$subreponame"
 
 git remote add "$subreponame" "$remoteurl" 2>/dev/null \
   || git remote set-url "$subreponame" "$remoteurl"
-git push --force "$subreponame" HEAD:main
+git push --force "$subreponame" HEAD:refs/heads/main
 git remote remove "$subreponame"
 
 echo "Pushed $subreponame"
