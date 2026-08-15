@@ -1,0 +1,5 @@
+//! Reusable ingress constructs. Consumers import Self/LoadBalancer (or the
+//! modules a deployment of this repository exports) rather than this
+//! entrypoint, which deploys nothing by itself.
+
+import Self/LoadBalancer

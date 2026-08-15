@@ -1,0 +1,985 @@
+import Self/Internal/HAProxy
+import Skyr/Resource
+import Skyr/Container
+import Skyr/Rollout
+import Std/Dict
+import Std/List
+import Std/Plugin
+import Std/Str
+import Std/Time
+
+export type Mode enum { .tcp, .http }
+
+export type Matcher enum { .sni(Str), .host(Str), .path(Str) }
+
+export type Probe enum { .connect, .http(Str) }
+
+export type HealthCheck {
+	interval: Time.Duration,
+	probe: Probe,
+}
+
+export type RuleTimeouts {
+	connect: Time.Duration?,
+	server: Time.Duration?,
+}
+
+export type RuleOptions<TFrontend> {
+	frontend: TFrontend,
+	matchers: [Matcher],
+	backends: [{
+		address: Str,
+		port: Int,
+	}],
+	timeouts: RuleTimeouts?,
+	healthCheck: HealthCheck?,
+}
+
+export type Rule<TFrontend> {
+	frontend: TFrontend,
+	qid: Str,
+}
+
+export type Timeouts {
+	connect: Time.Duration?,
+	client: Time.Duration?,
+	server: Time.Duration?,
+}
+
+export type FrontendOptions {
+	port: Int,
+	mode: Mode,
+	public: Bool?,
+	timeoutClient: Time.Duration?,
+}
+
+export type IngressOptions<TFrontend> {
+	name: Str,
+	region: Str?,
+	replicas: Int,
+	maxSurge: Int?,
+	maxUnavailable: Int?,
+	replica: {
+		cpu: Int,
+		memory: Int,
+	},
+	timeouts: Timeouts?,
+	frontends: #{TFrontend: FrontendOptions},
+	networks: #{Str: Container.Network}?,
+}
+
+export type Ingress<TFrontend> {
+	Rule: fn(RuleOptions<TFrontend>) Rule<TFrontend>,
+}
+
+export let InvalidOptions = exception(Str)
+
+export let InvalidRule = exception(Str)
+
+/// The millisecond value of a positive, linear duration; nil otherwise.
+/// A calendar-month component has no fixed length, so it cannot configure
+/// HAProxy timers.
+let linearMs: fn(Time.Duration) Int? = fn(d)
+	if ((d.months ?? 0) != 0)
+		nil
+	else if ((d.milliseconds ?? 0) > 0)
+		d.milliseconds
+
+let msOr = fn(d: Time.Duration?, fallback: Int)
+	switch d
+		case nil: fallback
+		case dur: linearMs(dur) ?? fallback
+
+let msOrNil = fn(d: Time.Duration?)
+	switch d
+		case nil: nil
+		case dur: linearMs(dur)
+
+// Capability predicates over a frontend's configuration. TLS termination,
+// when it arrives, widens these rather than changing any rule that uses them.
+let speaksHttp = fn(mode: Mode) mode == .http
+
+let hasTlsVisibility = fn(mode: Mode) mode == .tcp
+
+let durationErrors = fn(d: Time.Duration?, what: Str)
+	switch d
+		case nil: [] as [Str]
+		case dur:
+			if (linearMs(dur) == nil)
+				["{what} must be a positive millisecond-valued duration"]
+			else
+				[]
+
+let matcherModeErrors = fn(mode: Mode, m: Matcher)
+	switch m
+		case .sni(host):
+			if (hasTlsVisibility(mode))
+				[] as [Str]
+			else
+				["the sni matcher {host} needs TLS visibility, so its frontend must be mode tcp"]
+		case .host(host):
+			if (speaksHttp(mode))
+				[]
+			else
+				["the host matcher {host} needs an http frontend"]
+		case .path(path):
+			if (speaksHttp(mode))
+				[]
+			else
+				["the path matcher {path} needs an http frontend"]
+
+let probeModeErrors = fn(mode: Mode, p: Probe)
+	switch p
+		case .connect: [] as [Str]
+		case .http(path):
+			if (speaksHttp(mode))
+				[]
+			else
+				["the http health probe {path} needs an http frontend"]
+
+/// Everything wrong with a rule against the frontend it names. Checked in the
+/// Rule constructor, so an invalid rule fails the consumer's own deployment
+/// and never registers an instance.
+let ruleErrors = fn(
+	mode: Mode,
+	matchers: [Matcher],
+	timeouts: RuleTimeouts?,
+	healthCheck: HealthCheck?,
+)
+	[
+		if (List.isEmpty(matchers))
+			"a rule needs at least one matcher",
+		for (m in matchers) in matcherModeErrors(mode, m),
+		for (m in matchers)
+			in switch m
+				case .sni(host):
+					if (Str.isEmpty(host))
+						["an sni matcher needs a hostname"]
+					else
+						[] as [Str]
+				case .host(host):
+					if (Str.isEmpty(host))
+						["a host matcher needs a hostname"]
+					else
+						[]
+				case .path(path):
+					if (Str.startsWith(path, "/"))
+						[]
+					else
+						["the path matcher {path} must start with /"],
+		in switch healthCheck
+			case nil: [] as [Str]
+			case hc: [
+				in probeModeErrors(mode, hc.probe),
+				if (linearMs(hc.interval) == nil)
+					"the health check interval must be a positive millisecond-valued duration",
+				in switch hc.probe
+					case .connect: [] as [Str]
+					case .http(path):
+						if (Str.startsWith(path, "/"))
+							[]
+						else
+							["the http probe path {path} must start with /"],
+			],
+		in switch timeouts
+			case nil: [] as [Str]
+			case t: [
+				in durationErrors(t.connect, "the connect timeout"),
+				in durationErrors(t.server, "the server timeout"),
+			],
+	]
+
+/// A rule instance normalized for config generation: durations already
+/// converted to milliseconds, matchers deduplicated, frontend key rendered.
+type PreparedRule {
+	hash: Str,
+	frontend: Str,
+	matchers: [Matcher],
+	backends: [{
+		address: Str,
+		port: Int,
+	}],
+	timeoutConnectMs: Int?,
+	timeoutServerMs: Int?,
+	probe: Probe,
+	checkIntervalMs: Int,
+}
+
+type FrontendSpec {
+	name: Str,
+	port: Int,
+	mode: Mode,
+	public: Bool?,
+	timeoutClientMs: Int?,
+}
+
+type LiveRule {
+	mode: Mode,
+	rule: PreparedRule,
+}
+
+let maxOr0: fn([Int]) Int = fn(xs)
+	switch List.first(xs)
+		case nil: 0
+		case x:
+			let rest: Int = maxOr0(List.skip(xs, 1));
+			if (x > rest) x else rest
+
+let specificity = fn(matchers: [Matcher])
+	{
+		count: List.length(matchers),
+		pathLen: maxOr0([
+			for (m in matchers)
+				switch m
+					case .path(v): Str.length(v)
+					case _: 0,
+		]),
+		hostLen: maxOr0([
+			for (m in matchers)
+				switch m
+					case .sni(v): Str.length(v)
+					case .host(v): Str.length(v)
+					case _: 0,
+		]),
+	}
+
+let beforeOrEqual = fn(a: LiveRule, b: LiveRule)
+	let sa = specificity(a.rule.matchers);
+	let sb = specificity(b.rule.matchers);
+	if (sa.count != sb.count)
+		sa.count > sb.count
+	else if (sa.pathLen != sb.pathLen)
+		sa.pathLen > sb.pathLen
+	else if (sa.hostLen != sb.hostLen)
+		sa.hostLen > sb.hostLen
+	else
+		true
+
+let mergeLive: fn([LiveRule], [LiveRule]) [LiveRule] = fn(a, b)
+	switch List.first(a)
+		case nil: b
+		case x:
+			switch List.first(b)
+				case nil: a
+				case y:
+					if (beforeOrEqual(x, y))
+						[x, in mergeLive(List.skip(a, 1), b)]
+					else
+						[y, in mergeLive(a, List.skip(b, 1))]
+
+/// Stable sort, most specific rule first, so HAProxy's first-match-wins
+/// use_backend evaluation picks the most specific rule. Ties keep the
+/// deterministic instance order.
+let sortLive: fn([LiveRule]) [LiveRule] = fn(rules)
+	let n = List.length(rules);
+	if (n < 2)
+		rules
+	else
+		mergeLive(sortLive(List.take(rules, n / 2)), sortLive(List.skip(rules, n / 2)))
+
+/// Order-insensitive equality over deduplicated matcher lists.
+let sameMatchers = fn(a: [Matcher], b: [Matcher])
+	List.length(a) == List.length(b) && List.all(a, fn(m) List.contains(b, m))
+
+let trimTrailingSlash = fn(path: Str)
+	if (path != "/" && Str.endsWith(path, "/"))
+		Str.slice(path, 0, Str.length(path) - 1)
+	else
+		path
+
+/// The acl lines declaring matcher `m` under `name`. Repeated acl lines with
+/// one name OR together, which is how the segment-aware path prefix (exact hit
+/// or a hit on the next path segment) is expressed.
+let matcherAcl = fn(name: Str, m: Matcher)
+	let b = HAProxy.configBuilder;
+	switch m
+		// req_ssl_sni reads the inspected ClientHello (TLS passthrough); a
+		// terminating frontend will want ssl_fc_sni here instead.
+		case .sni(host): [b.statement("acl {name} req_ssl_sni -i {host}")]
+		case .host(host): [b.statement("acl {name} req.hdr(host),host_only -i -m str {host}")]
+		case .path(path):
+			let p = trimTrailingSlash(path);
+			if (p == "/")
+				[b.statement("acl {name} path_beg /")]
+			else
+				[b.statement("acl {name} path -m str {p}"), b.statement("acl {name} path_beg {p}/")]
+
+/// Mode compatibility re-checked at fold time: a frontend's mode may have
+/// changed after a rule registered against it, and folding a stale rule in
+/// would produce a config HAProxy refuses to load.
+let ruleModeErrors = fn(mode: Mode, rule: PreparedRule)
+	[for (m in rule.matchers) in matcherModeErrors(mode, m), in probeModeErrors(mode, rule.probe)]
+
+type RoutedRule {
+	mode: Mode,
+	rule: PreparedRule,
+	shadowedBy: Str?,
+}
+
+/// The acl and use_backend (or shadowing comment) lines for one rule.
+let ruleRouting = fn(r: RoutedRule)
+	let b = HAProxy.configBuilder;
+	switch r.shadowedBy
+		case nil:
+			let named = [
+				for (e in List.zip(List.range(List.length(r.rule.matchers)), r.rule.matchers))
+					{ name: "m-{r.rule.hash}-{e.a}", matcher: e.b },
+			];
+			let condition = Str.join([for (n in named) n.name], " ");
+			[
+				for (n in named) in matcherAcl(n.name, n.matcher),
+				b.statement("use_backend be-{r.rule.hash} if {condition}"),
+			]
+		case winner: [b.comment("be-{r.rule.hash} shadowed by be-{winner} (identical matchers)")]
+
+let frontendSection = fn(
+	fe: FrontendSpec,
+	routed: [RoutedRule],
+	dropped: [{ rule: PreparedRule, errors: [Str] }],
+)
+	let b = HAProxy.configBuilder;
+	let mine = [for (r in routed) if (r.rule.frontend == fe.name) r];
+	let myDropped = [for (d in dropped) if (d.rule.frontend == fe.name) d];
+	{
+		bind: fe.port,
+		public: fe.public,
+		statements: [
+			b.statement("mode {fe.mode}"),
+			b.statement(if (fe.mode == .http) "option httplog" else "option tcplog"),
+			if (fe.timeoutClientMs != nil)
+				b.statement("timeout client {fe.timeoutClientMs}"),
+			for (d in myDropped)
+				let reason = Str.join(d.errors, "; ");
+				b.comment("dropped be-{d.rule.hash}: {reason}"),
+			// SNI is only readable by inspecting the ClientHello, so hold the
+			// connection until it has arrived.
+			if (fe.mode == .tcp && !List.isEmpty(mine))
+				in [
+					b.statement("tcp-request inspect-delay 5s"),
+					b.statement("tcp-request content accept if \{ req_ssl_hello_type 1 }"),
+				],
+			for (r in mine) in ruleRouting(r),
+		],
+	}
+
+let backendStatements = fn(mode: Mode, rule: PreparedRule)
+	let b = HAProxy.configBuilder;
+	[
+		b.statement("mode {mode}"),
+		if (rule.timeoutConnectMs != nil)
+			b.statement("timeout connect {rule.timeoutConnectMs}"),
+		if (rule.timeoutServerMs != nil)
+			b.statement("timeout server {rule.timeoutServerMs}"),
+		in switch rule.probe
+			case .connect: [] as [HAProxy.ConfigStatement]
+			case .http(path): [b.statement("option httpchk GET {path}")],
+		for (e in List.zip(List.range(List.length(rule.backends)), rule.backends))
+			b.statement(
+				"server server{e.a + 1} {e.b.address}:{e.b.port} check inter {rule.checkIntervalMs}",
+			),
+	]
+
+let baseSections = fn(t: { connectMs: Int, clientMs: Int, serverMs: Int })
+	let b = HAProxy.configBuilder;
+	[
+		b.section(
+			b.statement("global"),
+			[b.statement("log stdout format raw local0 info"), b.statement("maxconn 4096")],
+		),
+		b.section(
+			b.statement("defaults"),
+			[
+				b.statement("log global"),
+				b.statement("default-server inter 2s fall 3 rise 2"),
+				b.statement("timeout connect {t.connectMs}"),
+				b.statement("timeout client {t.clientMs}"),
+				b.statement("timeout server {t.serverMs}"),
+			],
+		),
+	]
+
+/// Pure assembly of the whole HAProxy configuration; expects matchers already
+/// deduplicated (PreparedRule's contract). Rules that no longer fit their
+/// frontend are dropped with a comment, exact-duplicate matcher sets resolve
+/// first-wins with a comment, and zero rules still yields a valid config.
+let buildConfig = fn(
+	input: {
+		version: Str,
+		timeouts: { connectMs: Int, clientMs: Int, serverMs: Int },
+		frontends: [FrontendSpec],
+		rules: [PreparedRule],
+	},
+)
+	let modeByFrontend = #{
+		for (fe in input.frontends) fe.name: fe.mode,
+	};
+	let candidates = [
+		for (r in input.rules)
+			switch modeByFrontend[r.frontend]
+				case nil: { rule: r, mode: nil, errors: ["unknown frontend {r.frontend}"] }
+				case m: { rule: r, mode: m, errors: ruleModeErrors(m, r) },
+	];
+	let dropped = [
+		for (c in candidates)
+			if (!List.isEmpty(c.errors))
+				{ rule: c.rule, errors: c.errors },
+	];
+	let live = sortLive([
+		for (c in candidates)
+			if (List.isEmpty(c.errors))
+				in switch c.mode
+					case nil: [] as [LiveRule]
+					case m: [{ rule: c.rule, mode: m }],
+	]);
+	let routed = [
+		for (e in List.zip(List.range(List.length(live)), live))
+			{
+				mode: e.b.mode,
+				rule: e.b.rule,
+				shadowedBy: switch List.find(
+					List.take(live, e.a),
+					fn(prior)
+						prior.rule.frontend == e.b.rule.frontend && sameMatchers(
+							prior.rule.matchers,
+							e.b.rule.matchers,
+						),
+				)
+					case nil: nil
+					case winner: winner.rule.hash,
+			},
+	];
+	{
+		version: input.version,
+		extraSections: baseSections(input.timeouts),
+		frontends: #{
+			for (fe in input.frontends) fe.name: frontendSection(fe, routed, dropped),
+		},
+		backends: #{
+			for (r in routed)
+				if (r.shadowedBy == nil)
+					"be-{r.rule.hash}": backendStatements(r.mode, r.rule),
+		},
+	} as HAProxy.Config
+
+let ruleTimeoutMs = fn(t: RuleTimeouts?)
+	switch t
+		case nil: { connect: nil, server: nil }
+		case tt: { connect: msOrNil(tt.connect), server: msOrNil(tt.server) }
+
+let preparedCheck = fn(hc: HealthCheck?)
+	switch hc
+		case nil: { probe: .connect, intervalMs: 2000 }
+		case h: { probe: h.probe, intervalMs: linearMs(h.interval) ?? 2000 }
+
+export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
+	let optionErrors = [
+		in switch opts.timeouts
+			case nil: [] as [Str]
+			case t: [
+				in durationErrors(t.connect, "timeouts.connect"),
+				in durationErrors(t.client, "timeouts.client"),
+				in durationErrors(t.server, "timeouts.server"),
+			],
+		for (fe in Dict.entries(opts.frontends))
+			in durationErrors(fe.value.timeoutClient, "frontend {fe.key} timeoutClient"),
+	];
+	(
+		if (!List.isEmpty(optionErrors))
+			raise InvalidOptions(Str.join(optionErrors, "; "))
+	);
+	let resolvedTimeouts = switch opts.timeouts
+		case nil: { connectMs: 5000, clientMs: 30000, serverMs: 30000 }
+		case t:
+			{
+				connectMs: msOr(t.connect, 5000),
+				clientMs: msOr(t.client, 30000),
+				serverMs: msOr(t.server, 30000),
+			};
+	let frontendSpecs = [
+		for (fe in Dict.entries(opts.frontends))
+			{
+				name: "{fe.key}",
+				port: fe.value.port,
+				mode: fe.value.mode,
+				public: fe.value.public,
+				timeoutClientMs: msOrNil(fe.value.timeoutClient),
+			},
+	];
+	let ruleDef = Resource.Definition<RuleOptions<TFrontend>>("Rule");
+	let rules = [
+		for (rule in ruleDef.instances)
+			let t = ruleTimeoutMs(rule.timeouts);
+			let hc = preparedCheck(rule.healthCheck);
+			{
+				hash: Plugin.valueHash(rule),
+				frontend: "{rule.frontend}",
+				matchers: List.distinct(rule.matchers),
+				backends: rule.backends,
+				timeoutConnectMs: t.connect,
+				timeoutServerMs: t.server,
+				probe: hc.probe,
+				checkIntervalMs: hc.intervalMs,
+			},
+	];
+	let proxy = HAProxy.Proxy(
+		buildConfig({
+			version: "3.4",
+			timeouts: resolvedTimeouts,
+			frontends: frontendSpecs,
+			rules,
+		}),
+	);
+	Rollout.ReplicaSet({
+		name: opts.name,
+		count: opts.replicas,
+		maxSurge: opts.maxSurge,
+		maxUnavailable: opts.maxUnavailable,
+		replica: fn(r)
+			proxy.Pod({
+				name: "{opts.name}-{r.rev}",
+				region: opts.region,
+				cpu: opts.replica.cpu,
+				memory: opts.replica.memory,
+				networks: opts.networks,
+			}),
+	});
+	{
+		Rule: fn(ruleOpts)
+			switch opts.frontends[ruleOpts.frontend]
+				case nil: raise InvalidRule("rule references unknown frontend {ruleOpts.frontend}")
+				case fe:
+					let errors = ruleErrors(
+						fe.mode,
+						ruleOpts.matchers,
+						ruleOpts.timeouts,
+						ruleOpts.healthCheck,
+					);
+					if (!List.isEmpty(errors))
+						raise InvalidRule(Str.join(errors, "; "))
+					else
+						let rule = ruleDef.Resource(ruleOpts);
+						with (rule)
+							{
+								frontend: ruleOpts.frontend,
+								qid: rule.qid,
+							},
+	} as Ingress<TFrontend>
+)
+
+@test import Std/Test
+
+@test
+let testFe = fn(name: Str, port: Int, mode: Mode)
+	{ name, port, mode, public: nil, timeoutClientMs: nil } as FrontendSpec
+
+@test
+let testRule = fn(hash: Str, frontend: Str, matchers: [Matcher])
+	{
+		hash,
+		frontend,
+		matchers,
+		backends: [{ address: "10.0.0.1", port: 8080 }],
+		timeoutConnectMs: nil,
+		timeoutServerMs: nil,
+		probe: .connect,
+		checkIntervalMs: 2000,
+	} as PreparedRule
+
+@test let defaultTimeouts = { connectMs: 5000, clientMs: 30000, serverMs: 30000 }
+
+@test
+let lines = fn(statements: [HAProxy.ConfigStatement]?)
+	[for (s in statements ?? []) Str.join(s.tokens, " ")]
+
+@test
+let comments = fn(statements: [HAProxy.ConfigStatement]?)
+	[
+		for (s in statements ?? [])
+			if (s.comment != nil)
+				s.comment,
+	]
+
+@test
+let useBackends = fn(statements: [HAProxy.ConfigStatement]?)
+	[
+		for (l in lines(statements))
+			if (Str.startsWith(l, "use_backend"))
+				l,
+	]
+
+@test
+Test.group(
+	"linearMs",
+	fn()
+		Test.it(
+			"accepts a positive millisecond duration",
+			fn()
+				Test.expect(linearMs(Time.multiply(Time.second, 30))).toEqual(30000),
+		);
+		Test.it(
+			"rejects a calendar-month duration",
+			fn()
+				Test.expect(linearMs(Time.month)).toEqual(nil),
+		);
+		Test.it(
+			"rejects an empty duration",
+			fn()
+				Test.expect(linearMs({ months: nil, milliseconds: nil })).toEqual(nil),
+		);
+		Test.it(
+			"rejects a non-positive duration",
+			fn()
+				Test.expect(linearMs({ months: nil, milliseconds: 0 })).toEqual(nil),
+		),
+)
+
+@test
+Test.group(
+	"ruleErrors",
+	fn()
+		Test.it(
+			"rejects an empty matcher list",
+			fn()
+				Test.expect(ruleErrors(.http, [], nil, nil)).toEqual([
+					"a rule needs at least one matcher",
+				]),
+		);
+		Test.it(
+			"rejects an sni matcher on an http frontend",
+			fn()
+				Test.expect(ruleErrors(.http, [.sni("example.com")], nil, nil)).toEqual([
+					"the sni matcher example.com needs TLS visibility, so its frontend must be mode tcp",
+				]),
+		);
+		Test.it(
+			"rejects host and path matchers on a tcp frontend",
+			fn()
+				Test.expect(ruleErrors(.tcp, [.host("example.com"), .path("/api")], nil, nil)).toEqual([
+					"the host matcher example.com needs an http frontend",
+					"the path matcher /api needs an http frontend",
+				]),
+		);
+		Test.it(
+			"rejects a path matcher without a leading slash",
+			fn()
+				Test.expect(ruleErrors(.http, [.path("api")], nil, nil)).toEqual([
+					"the path matcher api must start with /",
+				]),
+		);
+		Test.it(
+			"rejects an http probe on a tcp frontend",
+			fn()
+				Test.expect(
+					ruleErrors(
+						.tcp,
+						[.sni("example.com")],
+						nil,
+						{ interval: Time.multiply(Time.second, 10), probe: .http("/healthz") },
+					),
+				).toEqual(["the http health probe /healthz needs an http frontend"]),
+		);
+		Test.it(
+			"rejects a non-linear health check interval",
+			fn()
+				Test.expect(
+					ruleErrors(
+						.http,
+						[.host("example.com")],
+						nil,
+						{ interval: Time.month, probe: .connect },
+					),
+				).toEqual([
+					"the health check interval must be a positive millisecond-valued duration",
+				]),
+		);
+		Test.it(
+			"rejects a non-linear rule timeout",
+			fn()
+				Test.expect(
+					ruleErrors(
+						.http,
+						[.host("example.com")],
+						{ connect: Time.month, server: nil },
+						nil,
+					),
+				).toEqual(["the connect timeout must be a positive millisecond-valued duration"]),
+		);
+		Test.it(
+			"accepts a valid http rule",
+			fn()
+				Test.expect(
+					ruleErrors(
+						.http,
+						[.host("example.com"), .path("/api")],
+						{ connect: Time.second, server: Time.multiply(Time.minute, 5) },
+						{ interval: Time.multiply(Time.second, 10), probe: .http("/healthz") },
+					),
+				).toEqual([]),
+		),
+)
+
+@test
+Test.group(
+	"buildConfig",
+	fn()
+		Test.it(
+			"formats a valid config with zero rules",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [],
+				});
+				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind *:80\n\tmode http\n\toption httplog\n",
+				),
+		);
+		Test.it(
+			"routes an http rule with segment-aware path matching",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [testRule("r1", "http", [.host("example.com"), .path("/api")])],
+				});
+				Test.expect(lines(config.frontends["http"]?.statements)).toEqual([
+					"mode http",
+					"option httplog",
+					"acl m-r1-0 req.hdr(host),host_only -i -m str example.com",
+					"acl m-r1-1 path -m str /api",
+					"acl m-r1-1 path_beg /api/",
+					"use_backend be-r1 if m-r1-0 m-r1-1",
+				]),
+		);
+		Test.it(
+			"routes a root path with a single prefix acl",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [testRule("r1", "http", [.path("/")])],
+				});
+				Test.expect(lines(config.frontends["http"]?.statements)).toEqual([
+					"mode http",
+					"option httplog",
+					"acl m-r1-0 path_beg /",
+					"use_backend be-r1 if m-r1-0",
+				]),
+		);
+		Test.it(
+			"inspects the ClientHello for sni rules on a tcp frontend",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("tls", 443, .tcp)],
+					rules: [testRule("r1", "tls", [.sni("db.example.com")])],
+				});
+				Test.expect(lines(config.frontends["tls"]?.statements)).toEqual([
+					"mode tcp",
+					"option tcplog",
+					"tcp-request inspect-delay 5s",
+					"tcp-request content accept if \{ req_ssl_hello_type 1 }",
+					"acl m-r1-0 req_ssl_sni -i db.example.com",
+					"use_backend be-r1 if m-r1-0",
+				]),
+		);
+		Test.it(
+			"skips the ClientHello inspection on a tcp frontend without rules",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("tls", 443, .tcp)],
+					rules: [],
+				});
+				Test.expect(lines(config.frontends["tls"]?.statements)).toEqual([
+					"mode tcp",
+					"option tcplog",
+				]),
+		);
+		Test.it(
+			"orders use_backend lines by specificity",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [
+						testRule("r1", "http", [.host("example.com")]),
+						testRule("r2", "http", [.host("example.com"), .path("/api")]),
+						testRule("r3", "http", [.host("example.com"), .path("/api/v2")]),
+					],
+				});
+				Test.expect(useBackends(config.frontends["http"]?.statements)).toEqual([
+					"use_backend be-r3 if m-r3-0 m-r3-1",
+					"use_backend be-r2 if m-r2-0 m-r2-1",
+					"use_backend be-r1 if m-r1-0",
+				]),
+		);
+		Test.it(
+			"shadows the later of two rules with identical matchers",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [
+						testRule("r1", "http", [.host("a.com")]),
+						testRule("r2", "http", [.host("a.com")]),
+					],
+				});
+				Test.expect(useBackends(config.frontends["http"]?.statements)).toEqual([
+					"use_backend be-r1 if m-r1-0",
+				]);
+				Test.expect(comments(config.frontends["http"]?.statements)).toEqual([
+					"be-r2 shadowed by be-r1 (identical matchers)",
+				]);
+				Test.expect(Dict.has(config.backends, "be-r2")).toEqual(false),
+		);
+		Test.it(
+			"does not shadow identical matchers across frontends",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("a", 80, .http), testFe("b", 8080, .http)],
+					rules: [
+						testRule("r1", "a", [.host("a.com")]),
+						testRule("r2", "b", [.host("a.com")]),
+					],
+				});
+				Test.expect(useBackends(config.frontends["a"]?.statements)).toEqual([
+					"use_backend be-r1 if m-r1-0",
+				]);
+				Test.expect(useBackends(config.frontends["b"]?.statements)).toEqual([
+					"use_backend be-r2 if m-r2-0",
+				]),
+		);
+		Test.it(
+			"drops a rule whose matchers no longer fit its frontend",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [testRule("r1", "http", [.sni("example.com")])],
+				});
+				Test.expect(useBackends(config.frontends["http"]?.statements)).toEqual([] as [Str]);
+				Test.expect(comments(config.frontends["http"]?.statements)).toEqual([
+					"dropped be-r1: the sni matcher example.com needs TLS visibility, so its frontend must be mode tcp",
+				]);
+				Test.expect(Dict.has(config.backends, "be-r1")).toEqual(false),
+		);
+		Test.it(
+			"drops a rule referencing an unknown frontend",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [testRule("r1", "gone", [.host("example.com")])],
+				});
+				Test.expect(useBackends(config.frontends["http"]?.statements)).toEqual([] as [Str]);
+				Test.expect(Dict.has(config.backends, "be-r1")).toEqual(false),
+		);
+		Test.it(
+			"emits backend health checks, timeouts and probes",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [{
+						hash: "r1",
+						frontend: "http",
+						matchers: [.host("example.com")],
+						backends: [
+							{ address: "10.0.0.1", port: 8080 },
+							{ address: "10.0.0.2", port: 8080 },
+						],
+						timeoutConnectMs: 1000,
+						timeoutServerMs: 300000,
+						probe: .http("/healthz"),
+						checkIntervalMs: 10000,
+					}],
+				});
+				Test.expect(lines(config.backends["be-r1"])).toEqual([
+					"mode http",
+					"timeout connect 1000",
+					"timeout server 300000",
+					"option httpchk GET /healthz",
+					"server server1 10.0.0.1:8080 check inter 10000",
+					"server server2 10.0.0.2:8080 check inter 10000",
+				]),
+		);
+		Test.it(
+			"emits frontend client timeout overrides",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [{
+						name: "ws",
+						port: 80,
+						mode: .http,
+						public: nil,
+						timeoutClientMs: 3600000,
+					}],
+					rules: [],
+				});
+				Test.expect(lines(config.frontends["ws"]?.statements)).toEqual([
+					"mode http",
+					"option httplog",
+					"timeout client 3600000",
+				]),
+		),
+)
+
+@test
+let i = Proxy({
+	name: "my-ingress",
+	replicas: 4,
+	replica: {
+		cpu: 500,
+		memory: 1024 * 32,
+	},
+	timeouts: { connect: Time.second, client: nil, server: Time.multiply(Time.minute, 1) },
+	frontends: #{
+		.http: { port: 80, mode: .http },
+		.tls: { port: 443, mode: .tcp },
+	},
+})
+
+@test
+i.Rule({
+	frontend: .http,
+	matchers: [.host("my-host.example.com"), .path("/api")],
+	backends: [{ address: "my-host", port: 8080 }],
+	healthCheck: { interval: Time.multiply(Time.second, 10), probe: .http("/healthz") },
+})
+
+@test
+i.Rule({
+	frontend: .tls,
+	matchers: [.sni("db.example.com")],
+	backends: [{ address: "my-db", port: 5432 }],
+	timeouts: { connect: Time.second, server: Time.multiply(Time.minute, 30) },
+})
+
+@test
+Test.it(
+	"rejects an invalid rule before registering an instance",
+	fn()
+		Test.expect(
+			fn()
+				i.Rule({
+					frontend: .http,
+					matchers: [.sni("db.example.com")],
+					backends: [{ address: "my-db", port: 5432 }],
+				}),
+		).toRaise(InvalidRule),
+)
