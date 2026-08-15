@@ -1,0 +1,8 @@
+import Skyr/IAM
+
+IAM.Policy({
+	name: "public-repos",
+	subjects: ["Anonymous"],
+	verbs: ["repository:View"],
+	objects: ["Constructs/*"],
+})
