@@ -32,6 +32,12 @@ export type RuleOptions<TFrontend> {
 	}],
 	timeouts: RuleTimeouts?,
 	healthCheck: HealthCheck?,
+	/// The certificate this rule's frontend should present for the hostnames
+	/// the rule matches. Only for a frontend that terminates TLS, and only
+	/// needed by a rule that introduces a hostname of its own: a rule sharing a
+	/// hostname another rule already brought a certificate for — splitting it
+	/// by path, say — is served by that one.
+	tls: Certificate?,
 }
 
 export type Rule<TFrontend> {
@@ -45,16 +51,26 @@ export type Timeouts {
 	server: Time.Duration?,
 }
 
-/// A certificate for a frontend to terminate TLS with. Provisioning it is
-/// somebody else's job: this is only what a bind needs to serve it.
-export type Tls {
+/// Whether a frontend completes the TLS handshake itself. Termination is a
+/// property of the bind, not of a rule — every connection to the port shares
+/// one handshake — so the frontend declares it and rules supply the
+/// certificates. A rule cannot flip the port between cleartext and TLS from
+/// another repository.
+export type Tls enum { .terminate }
+
+/// A certificate a rule brings for the hostnames it serves. Provisioning it is
+/// somebody else's job: this is only what a bind needs to present it.
+export type Certificate {
 	/// The PEM-encoded certificate chain, leaf first. It is public material,
 	/// so it travels as text.
-	certificate: Str,
+	chain: Str,
 	/// The Secret Version QID of the matching PEM-encoded private key —
 	/// `Secret.get("my-tls-key").qid` at the call site. The plaintext is
 	/// resolved inside the platform when a replica materializes, so it enters
 	/// neither this configuration nor the inputs Skyr stores.
+	///
+	/// The replicas belong to this ingress, so its deployment role needs
+	/// `secret:View` on the secret — a grant the rule's own repository makes.
 	privateKey: Str,
 }
 
@@ -63,8 +79,11 @@ export type FrontendOptions {
 	mode: Mode,
 	public: Bool?,
 	timeoutClient: Time.Duration?,
-	/// Terminate TLS on this frontend. Absent, the frontend serves what it is
-	/// given: cleartext in mode http, an opaque byte stream in mode tcp.
+	/// Terminate TLS on this frontend. The bind declares `strict-sni`, so a
+	/// handshake whose SNI no rule brought a certificate for is refused rather
+	/// than answered with somebody else's certificate. Absent, the frontend
+	/// serves what it is given: cleartext in mode http, an opaque byte stream
+	/// in mode tcp.
 	tls: Tls?,
 }
 
@@ -119,7 +138,7 @@ type Capabilities {
 }
 
 let capabilities = fn(fe: FrontendOptions)
-	{ mode: fe.mode, terminatesTls: fe.tls != nil } as Capabilities
+	{ mode: fe.mode, terminatesTls: fe.tls == .terminate } as Capabilities
 
 let speaksHttp = fn(c: Capabilities) c.mode == .http
 
@@ -169,6 +188,20 @@ let probeModeErrors = fn(caps: Capabilities, p: Probe)
 			else
 				["the http health probe {path} needs an http frontend"]
 
+/// Everything wrong with the certificate a rule brings, which is nothing at
+/// all when it brings none.
+let certificateErrors = fn(caps: Capabilities, tls: Certificate?)
+	switch tls
+		case nil: [] as [Str]
+		case cert: [
+			if (!caps.terminatesTls)
+				"a rule certificate needs a frontend that terminates TLS",
+			if (!Str.startsWith(cert.chain, "-----BEGIN "))
+				"a rule certificate chain must be PEM-encoded",
+			if (Str.isEmpty(cert.privateKey))
+				"a rule certificate needs the secret version qid of its private key",
+		]
+
 /// Everything wrong with a rule against the frontend it names. Checked in the
 /// Rule constructor, so an invalid rule fails the consumer's own deployment
 /// and never registers an instance.
@@ -177,11 +210,13 @@ let ruleErrors = fn(
 	matchers: [Matcher],
 	timeouts: RuleTimeouts?,
 	healthCheck: HealthCheck?,
+	tls: Certificate?,
 )
 	[
 		if (List.isEmpty(matchers))
 			"a rule needs at least one matcher",
 		for (m in matchers) in matcherModeErrors(caps, m),
+		in certificateErrors(caps, tls),
 		for (m in matchers)
 			in switch m
 				case .sni(host):
@@ -235,6 +270,7 @@ type PreparedRule {
 	timeoutServerMs: Int?,
 	probe: Probe,
 	checkIntervalMs: Int,
+	certificate: HAProxy.Certificate?,
 }
 
 type FrontendSpec {
@@ -243,11 +279,11 @@ type FrontendSpec {
 	mode: Mode,
 	public: Bool?,
 	timeoutClientMs: Int?,
-	certificate: HAProxy.Certificate?,
+	terminatesTls: Bool,
 }
 
 let frontendCapabilities = fn(fe: FrontendSpec)
-	{ mode: fe.mode, terminatesTls: fe.certificate != nil } as Capabilities
+	{ mode: fe.mode, terminatesTls: fe.terminatesTls } as Capabilities
 
 type LiveRule {
 	caps: Capabilities,
@@ -349,13 +385,79 @@ let matcherAcl = fn(caps: Capabilities, name: Str, m: Matcher)
 /// changed after a rule registered against it, and folding a stale rule in
 /// would produce a config HAProxy refuses to load.
 let ruleModeErrors = fn(caps: Capabilities, rule: PreparedRule)
-	[for (m in rule.matchers) in matcherModeErrors(caps, m), in probeModeErrors(caps, rule.probe)]
+	[
+		for (m in rule.matchers) in matcherModeErrors(caps, m),
+		in probeModeErrors(caps, rule.probe),
+		if (rule.certificate != nil && !caps.terminatesTls)
+			"its certificate needs a frontend that terminates TLS",
+	]
 
 type RoutedRule {
 	caps: Capabilities,
 	rule: PreparedRule,
 	shadowedBy: Str?,
 }
+
+/// The hostnames a rule claims, which become the SNI filters selecting its
+/// certificate. A rule matching on path alone claims none, and its certificate
+/// is then selected the ordinary way, against the CN and SANs it carries.
+let ruleHostnames = fn(matchers: [Matcher])
+	List.distinct([
+		for (m in matchers)
+			in switch m
+				case .sni(host): [host]
+				case .host(host): [host]
+				case .path(_): [] as [Str],
+	])
+
+/// One rule's line in a frontend's certificate list.
+type CertificateLine {
+	hash: Str,
+	sniFilters: [Str],
+	/// Hostnames an earlier rule's certificate already serves. Any at all and
+	/// this certificate is not listed: a rule matches on all of its matchers at
+	/// once, so a name it cannot claim is a name it could not have served.
+	taken: [Str],
+}
+
+let isServed = fn(c: CertificateLine) List.isEmpty(c.taken)
+
+/// Hostnames are claimed first-come, in routing order, so a hostname two rules
+/// both bring a certificate for is served by exactly one of them. HAProxy
+/// accepts a duplicate crt-list filter in silence and picks for itself, which
+/// on a shared ingress would let one repository quietly take over another's
+/// hostname; resolving it here makes the loser visible in the config instead.
+let claimCertificates: fn([RoutedRule], [Str]) [CertificateLine] = fn(rules, claimed)
+	switch List.first(rules)
+		case nil: [] as [CertificateLine]
+		case r:
+			let rest = List.skip(rules, 1);
+			if (r.rule.certificate == nil)
+				claimCertificates(rest, claimed)
+			else
+				let wanted = ruleHostnames(r.rule.matchers);
+				let taken = [for (h in wanted) if (List.contains(claimed, h)) h];
+				if (List.isEmpty(taken))
+					[
+						{ hash: r.rule.hash, sniFilters: wanted, taken },
+						in claimCertificates(rest, [in claimed, in wanted]),
+					]
+				else
+					[
+						{ hash: r.rule.hash, sniFilters: [] as [Str], taken },
+						in claimCertificates(rest, claimed),
+					]
+
+/// The certificate lines for one frontend, in routing order. A shadowed rule
+/// routes nothing, so its certificate is not collected either.
+let frontendCertificates = fn(fe: FrontendSpec, routed: [RoutedRule])
+	if (fe.terminatesTls)
+		claimCertificates(
+			[for (r in routed) if (r.rule.frontend == fe.name && r.shadowedBy == nil) r],
+			[] as [Str],
+		)
+	else
+		[] as [CertificateLine]
 
 /// The acl and use_backend (or shadowing comment) lines for one rule.
 let ruleRouting = fn(r: RoutedRule)
@@ -377,23 +479,25 @@ let frontendSection = fn(
 	fe: FrontendSpec,
 	routed: [RoutedRule],
 	dropped: [{ rule: PreparedRule, errors: [Str] }],
+	certificates: [CertificateLine],
 )
 	let b = HAProxy.configBuilder;
 	let mine = [for (r in routed) if (r.rule.frontend == fe.name) r];
 	let myDropped = [for (d in dropped) if (d.rule.frontend == fe.name) d];
 	{
 		bind: fe.port,
-		// `crt` names the chain only; HAProxy pairs it with the `.key` file
-		// beside it, which is where the private key the platform resolved
-		// lands. ALPN is offered only where the frontend speaks HTTP itself —
-		// a terminating tcp frontend hands the plaintext on untouched, so it
-		// has no protocol to negotiate on the client's behalf.
-		bindArgs: if (fe.certificate != nil)
+		// The certificates are a list rather than a single `crt` because each
+		// arrives with a rule. `strict-sni` refuses a handshake no listed
+		// certificate matches, instead of answering it with whichever one
+		// happens to lead the list. ALPN is offered only where the frontend
+		// speaks HTTP itself — a terminating tcp frontend hands the plaintext
+		// on untouched, so it has no protocol to negotiate for the client.
+		bindArgs: if (fe.terminatesTls)
 			b.statement(
 				if (fe.mode == .http)
-					"ssl crt {HAProxy.certificatePath(fe.name)} alpn h2,http/1.1"
+					"ssl crt-list {HAProxy.certificateListPath(fe.name)} strict-sni alpn h2,http/1.1"
 				else
-					"ssl crt {HAProxy.certificatePath(fe.name)}",
+					"ssl crt-list {HAProxy.certificateListPath(fe.name)} strict-sni",
 			),
 		public: fe.public,
 		statements: [
@@ -404,6 +508,10 @@ let frontendSection = fn(
 			for (d in myDropped)
 				let reason = Str.join(d.errors, "; ");
 				b.comment("dropped be-{d.rule.hash}: {reason}"),
+			for (c in certificates)
+				if (!isServed(c))
+					let hosts = Str.join(c.taken, ", ");
+					b.comment("cert-{c.hash} unused: {hosts} claimed by an earlier rule"),
 			// Where SNI is only readable by inspecting the ClientHello, hold
 			// the connection until it has arrived. A terminating frontend has
 			// already consumed that handshake, so it must not wait for one.
@@ -502,11 +610,21 @@ let buildConfig = fn(
 					case winner: winner.rule.hash,
 			},
 	];
+	let certificateLines = #{
+		for (fe in input.frontends) fe.name: frontendCertificates(fe, routed),
+	};
+	let served = [
+		for (r in routed)
+			for (c in certificateLines[r.rule.frontend] ?? [])
+				if (isServed(c) && c.hash == r.rule.hash)
+					{ hash: r.rule.hash, certificate: r.rule.certificate },
+	];
 	{
 		version: input.version,
 		extraSections: baseSections(input.timeouts),
 		frontends: #{
-			for (fe in input.frontends) fe.name: frontendSection(fe, routed, dropped),
+			for (fe in input.frontends)
+				fe.name: frontendSection(fe, routed, dropped, certificateLines[fe.name] ?? []),
 		},
 		backends: #{
 			for (r in routed)
@@ -514,9 +632,18 @@ let buildConfig = fn(
 					"be-{r.rule.hash}": backendStatements(r.caps.mode, r.rule),
 		},
 		certificates: #{
+			for (s in served)
+				if (s.certificate != nil)
+					"cert-{s.hash}": s.certificate,
+		},
+		certificateLists: #{
 			for (fe in input.frontends)
-				if (fe.certificate != nil)
-					fe.name: fe.certificate,
+				if (fe.terminatesTls)
+					fe.name: [
+						for (c in certificateLines[fe.name] ?? [])
+							if (isServed(c))
+								{ certificate: "cert-{c.hash}", sniFilters: c.sniFilters },
+					],
 		},
 	} as HAProxy.Config
 
@@ -524,19 +651,6 @@ let ruleTimeoutMs = fn(t: RuleTimeouts?)
 	switch t
 		case nil: { connect: nil, server: nil }
 		case tt: { connect: msOrNil(tt.connect), server: msOrNil(tt.server) }
-
-/// A certificate is checked for the shape HAProxy will refuse to start
-/// without, so a mistyped or empty value fails the deployment that made it
-/// rather than the replicas that would have served it.
-let tlsErrors = fn(name: Str, tls: Tls?)
-	switch tls
-		case nil: [] as [Str]
-		case t: [
-			if (!Str.startsWith(t.certificate, "-----BEGIN "))
-				"frontend {name} tls.certificate must be a PEM-encoded certificate chain",
-			if (Str.isEmpty(t.privateKey))
-				"frontend {name} tls.privateKey must be a secret version qid",
-		]
 
 let preparedCheck = fn(hc: HealthCheck?)
 	switch hc
@@ -554,7 +668,6 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 			],
 		for (fe in Dict.entries(opts.frontends))
 			in durationErrors(fe.value.timeoutClient, "frontend {fe.key} timeoutClient"),
-		for (fe in Dict.entries(opts.frontends)) in tlsErrors("{fe.key}", fe.value.tls),
 	];
 	(
 		if (!List.isEmpty(optionErrors))
@@ -576,9 +689,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 				mode: fe.value.mode,
 				public: fe.value.public,
 				timeoutClientMs: msOrNil(fe.value.timeoutClient),
-				certificate: switch fe.value.tls
-					case nil: nil
-					case t: { certificatePem: t.certificate, privateKeyQid: t.privateKey },
+				terminatesTls: fe.value.tls == .terminate,
 			},
 	];
 	let ruleDef = Resource.Definition<RuleOptions<TFrontend>>("Rule");
@@ -595,6 +706,9 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 				timeoutServerMs: t.server,
 				probe: hc.probe,
 				checkIntervalMs: hc.intervalMs,
+				certificate: switch rule.tls
+					case nil: nil
+					case cert: { certificatePem: cert.chain, privateKeyQid: cert.privateKey },
 			},
 	];
 	let proxy = HAProxy.Proxy(
@@ -631,6 +745,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 						ruleOpts.matchers,
 						ruleOpts.timeouts,
 						ruleOpts.healthCheck,
+						ruleOpts.tls,
 					);
 					if (!List.isEmpty(errors))
 						raise InvalidRule(Str.join(errors, "; "))
@@ -651,11 +766,11 @@ let testCert = { certificatePem: "-----BEGIN CERTIFICATE-----\n", privateKeyQid:
 
 @test
 let testFe = fn(name: Str, port: Int, mode: Mode)
-	{ name, port, mode, public: nil, timeoutClientMs: nil, certificate: nil } as FrontendSpec
+	{ name, port, mode, public: nil, timeoutClientMs: nil, terminatesTls: false } as FrontendSpec
 
 @test
 let testTlsFe = fn(name: Str, port: Int, mode: Mode)
-	{ name, port, mode, public: nil, timeoutClientMs: nil, certificate: testCert } as FrontendSpec
+	{ name, port, mode, public: nil, timeoutClientMs: nil, terminatesTls: true } as FrontendSpec
 
 @test let plaintext = { mode: .http, terminatesTls: false } as Capabilities
 
@@ -674,6 +789,21 @@ let testRule = fn(hash: Str, frontend: Str, matchers: [Matcher])
 		timeoutServerMs: nil,
 		probe: .connect,
 		checkIntervalMs: 2000,
+		certificate: nil,
+	} as PreparedRule
+
+@test
+let testCertRule = fn(hash: Str, frontend: Str, matchers: [Matcher])
+	{
+		hash,
+		frontend,
+		matchers,
+		backends: [{ address: "10.0.0.1", port: 8080 }],
+		timeoutConnectMs: nil,
+		timeoutServerMs: nil,
+		probe: .connect,
+		checkIntervalMs: 2000,
+		certificate: testCert,
 	} as PreparedRule
 
 @test let defaultTimeouts = { connectMs: 5000, clientMs: 30000, serverMs: 30000 }
@@ -731,21 +861,21 @@ Test.group(
 		Test.it(
 			"rejects an empty matcher list",
 			fn()
-				Test.expect(ruleErrors(plaintext, [], nil, nil)).toEqual([
+				Test.expect(ruleErrors(plaintext, [], nil, nil, nil)).toEqual([
 					"a rule needs at least one matcher",
 				]),
 		);
 		Test.it(
 			"rejects an sni matcher on a plaintext http frontend",
 			fn()
-				Test.expect(ruleErrors(plaintext, [.sni("example.com")], nil, nil)).toEqual([
+				Test.expect(ruleErrors(plaintext, [.sni("example.com")], nil, nil, nil)).toEqual([
 					"the sni matcher example.com needs TLS visibility, so its frontend must be mode tcp or terminate TLS",
 				]),
 		);
 		Test.it(
 			"accepts an sni matcher on a terminating http frontend",
 			fn()
-				Test.expect(ruleErrors(terminating, [.sni("example.com")], nil, nil)).toEqual(
+				Test.expect(ruleErrors(terminating, [.sni("example.com")], nil, nil, nil)).toEqual(
 					[] as [Str],
 				),
 		);
@@ -753,14 +883,14 @@ Test.group(
 			"accepts host and path matchers on a terminating http frontend",
 			fn()
 				Test.expect(
-					ruleErrors(terminating, [.host("example.com"), .path("/api")], nil, nil),
+					ruleErrors(terminating, [.host("example.com"), .path("/api")], nil, nil, nil),
 				).toEqual([] as [Str]),
 		);
 		Test.it(
 			"rejects host and path matchers on a tcp frontend",
 			fn()
 				Test.expect(
-					ruleErrors(passthrough, [.host("example.com"), .path("/api")], nil, nil),
+					ruleErrors(passthrough, [.host("example.com"), .path("/api")], nil, nil, nil),
 				).toEqual([
 					"the host matcher example.com needs an http frontend",
 					"the path matcher /api needs an http frontend",
@@ -769,7 +899,7 @@ Test.group(
 		Test.it(
 			"rejects a path matcher without a leading slash",
 			fn()
-				Test.expect(ruleErrors(plaintext, [.path("api")], nil, nil)).toEqual([
+				Test.expect(ruleErrors(plaintext, [.path("api")], nil, nil, nil)).toEqual([
 					"the path matcher api must start with /",
 				]),
 		);
@@ -782,6 +912,7 @@ Test.group(
 						[.sni("example.com")],
 						nil,
 						{ interval: Time.multiply(Time.second, 10), probe: .http("/healthz") },
+						nil,
 					),
 				).toEqual(["the http health probe /healthz needs an http frontend"]),
 		);
@@ -794,6 +925,7 @@ Test.group(
 						[.sni("example.com")],
 						nil,
 						{ interval: Time.multiply(Time.second, 10), probe: .http("/healthz") },
+						nil,
 					),
 				).toEqual([] as [Str]),
 		);
@@ -806,6 +938,7 @@ Test.group(
 						[.host("example.com")],
 						nil,
 						{ interval: Time.month, probe: .connect },
+						nil,
 					),
 				).toEqual([
 					"the health check interval must be a positive millisecond-valued duration",
@@ -820,6 +953,7 @@ Test.group(
 						[.host("example.com")],
 						{ connect: Time.month, server: nil },
 						nil,
+						nil,
 					),
 				).toEqual(["the connect timeout must be a positive millisecond-valued duration"]),
 		);
@@ -832,6 +966,7 @@ Test.group(
 						[.host("example.com"), .path("/api")],
 						{ connect: Time.second, server: Time.multiply(Time.minute, 5) },
 						{ interval: Time.multiply(Time.second, 10), probe: .http("/healthz") },
+						nil,
 					),
 				).toEqual([]),
 		),
@@ -907,23 +1042,24 @@ Test.group(
 				]),
 		);
 		Test.it(
-			"terminates TLS with a crt bind argument, and advertises h2 on http",
+			"terminates TLS against a certificate list, and advertises h2 on http",
 			fn()
 				let config = buildConfig({
 					version: "3.4",
 					timeouts: defaultTimeouts,
 					frontends: [testTlsFe("https", 443, .http)],
-					rules: [testRule("r1", "https", [.host("example.com")])],
+					rules: [testCertRule("r1", "https", [.host("example.com")])],
 				});
 				Test.expect(config.frontends["https"]?.bindArgs?.tokens).toEqual([
 					"ssl",
-					"crt",
-					"/usr/local/etc/haproxy/tls/https.pem",
+					"crt-list",
+					"/usr/local/etc/haproxy/tls/https.list",
+					"strict-sni",
 					"alpn",
 					"h2,http/1.1",
 				]);
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 ssl crt /usr/local/etc/haproxy/tls/https.pem alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
 				),
 		);
 		Test.it(
@@ -937,8 +1073,129 @@ Test.group(
 				});
 				Test.expect(config.frontends["tls"]?.bindArgs?.tokens).toEqual([
 					"ssl",
-					"crt",
-					"/usr/local/etc/haproxy/tls/tls.pem",
+					"crt-list",
+					"/usr/local/etc/haproxy/tls/tls.list",
+					"strict-sni",
+				]),
+		);
+		Test.it(
+			"still binds a terminating frontend no rule has brought a certificate for",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [],
+				});
+				// strict-sni permits a bind with no certificate, so a fresh
+				// ingress serves nothing rather than failing to start.
+				Test.expect((config.certificateLists ?? #{})["https"]).toEqual(
+					[] as [HAProxy.CertificateListEntry],
+				);
+				Test.expect(Dict.keys(config.certificates ?? #{})).toEqual([] as [Str]),
+		);
+		Test.it(
+			"filters each rule's certificate by the hostnames that rule matches",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [
+						testCertRule("r1", "https", [.host("a.example.com")]),
+						testCertRule("r2", "https", [.host("b.example.com")]),
+					],
+				});
+				Test.expect((config.certificateLists ?? #{})["https"]).toEqual([
+					{ certificate: "cert-r1", sniFilters: ["a.example.com"] },
+					{ certificate: "cert-r2", sniFilters: ["b.example.com"] },
+				]);
+				Test.expect(Dict.keys(config.certificates ?? #{})).toEqual(["cert-r1", "cert-r2"]),
+		);
+		Test.it(
+			"leaves a path-only rule's certificate to be selected by its own SANs",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [testCertRule("r1", "https", [.path("/api")])],
+				});
+				Test.expect((config.certificateLists ?? #{})["https"]).toEqual([
+					{ certificate: "cert-r1", sniFilters: [] as [Str] },
+				]),
+		);
+		Test.it(
+			"gives a hostname to the first rule that claims it",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [
+						testCertRule("r1", "https", [.host("shared.example.com"), .path("/a")]),
+						testCertRule("r2", "https", [.host("shared.example.com"), .path("/b")]),
+					],
+				});
+				Test.expect((config.certificateLists ?? #{})["https"]).toEqual([
+					{ certificate: "cert-r1", sniFilters: ["shared.example.com"] },
+				]);
+				Test.expect(Dict.keys(config.certificates ?? #{})).toEqual(["cert-r1"]);
+				Test.expect(comments(config.frontends["https"]?.statements)).toEqual([
+					"cert-r2 unused: shared.example.com claimed by an earlier rule",
+				]),
+		);
+		Test.it(
+			"claims hostnames in routing order rather than declaration order",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [
+						testCertRule("r1", "https", [.host("shared.example.com")]),
+						testCertRule("r2", "https", [.host("shared.example.com"), .path("/api")]),
+					],
+				});
+				// r2 is the more specific rule, so it routes first and claims the
+				// hostname first — the same order in both places, which is what
+				// keeps the certificate serving a name that still routes.
+				Test.expect((config.certificateLists ?? #{})["https"]).toEqual([
+					{ certificate: "cert-r2", sniFilters: ["shared.example.com"] },
+				]);
+				Test.expect(comments(config.frontends["https"]?.statements)).toEqual([
+					"cert-r1 unused: shared.example.com claimed by an earlier rule",
+				]),
+		);
+		Test.it(
+			"drops a certificate whose frontend no longer terminates TLS",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [testCertRule("r1", "http", [.host("example.com")])],
+				});
+				Test.expect(useBackends(config.frontends["http"]?.statements)).toEqual([] as [Str]);
+				Test.expect(comments(config.frontends["http"]?.statements)).toEqual([
+					"dropped be-r1: its certificate needs a frontend that terminates TLS",
+				]);
+				Test.expect(Dict.keys(config.certificates ?? #{})).toEqual([] as [Str]),
+		);
+		Test.it(
+			"collects no certificate from a shadowed rule",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [
+						testCertRule("r1", "https", [.host("a.example.com")]),
+						testCertRule("r2", "https", [.host("a.example.com")]),
+					],
+				});
+				Test.expect((config.certificateLists ?? #{})["https"]).toEqual([
+					{ certificate: "cert-r1", sniFilters: ["a.example.com"] },
 				]),
 		);
 		Test.it(
@@ -974,18 +1231,19 @@ Test.group(
 				]),
 		);
 		Test.it(
-			"carries a certificate per terminating frontend, and none for the rest",
+			"leaves a frontend that does not terminate without bind arguments",
 			fn()
 				let config = buildConfig({
 					version: "3.4",
 					timeouts: defaultTimeouts,
 					frontends: [testFe("http", 80, .http), testTlsFe("https", 443, .http)],
-					rules: [],
+					rules: [testCertRule("r1", "https", [.host("example.com")])],
 				});
-				let certificates = config.certificates ?? #{};
-				Test.expect(Dict.keys(certificates)).toEqual(["https"]);
-				Test.expect(certificates["https"]?.privateKeyQid).toEqual("org/repo!k@1");
-				Test.expect(config.frontends["http"]?.bindArgs).toEqual(nil),
+				Test.expect(config.frontends["http"]?.bindArgs).toEqual(nil);
+				Test.expect(Dict.keys(config.certificateLists ?? #{})).toEqual(["https"]);
+				Test.expect((config.certificates ?? #{})["cert-r1"]?.privateKeyQid).toEqual(
+					"org/repo!k@1",
+				),
 		);
 		Test.it(
 			"skips the ClientHello inspection on a tcp frontend without rules",
@@ -1128,6 +1386,7 @@ Test.group(
 						mode: .http,
 						public: nil,
 						timeoutClientMs: 3600000,
+						terminatesTls: false,
 					}],
 					rules: [],
 				});
@@ -1150,16 +1409,7 @@ let i = Proxy({
 	timeouts: { connect: Time.second, client: nil, server: Time.multiply(Time.minute, 1) },
 	frontends: #{
 		.http: { port: 80, mode: .http },
-		.https: {
-			port: 443,
-			mode: .http,
-			// In a deployment this is `Secret.get("my-tls-key").qid`; a test
-			// run resolves no secrets, so it stands in as a literal qid.
-			tls: {
-				certificate: "-----BEGIN CERTIFICATE-----\n",
-				privateKey: "my-org/my-repo!my-tls-key@abc",
-			},
-		},
+		.https: { port: 443, mode: .http, tls: .terminate },
 		.tls: { port: 8443, mode: .tcp },
 	},
 })
@@ -1169,6 +1419,21 @@ i.Rule({
 	frontend: .https,
 	matchers: [.host("my-host.example.com")],
 	backends: [{ address: "my-host", port: 8080 }],
+	// In a deployment the key is `Secret.get("my-tls-key").qid`; a test run
+	// resolves no secrets, so it stands in as a literal qid here.
+	tls: {
+		chain: "-----BEGIN CERTIFICATE-----\n",
+		privateKey: "my-org/my-repo!my-tls-key@abc",
+	},
+})
+
+// A second rule under the same hostname, split off by path. It brings no
+// certificate of its own — the rule above already serves that name.
+@test
+i.Rule({
+	frontend: .https,
+	matchers: [.host("my-host.example.com"), .path("/api")],
+	backends: [{ address: "my-api", port: 8080 }],
 })
 
 @test
@@ -1203,41 +1468,45 @@ Test.it(
 
 @test
 Test.it(
-	"accepts an sni rule against a frontend that terminates TLS",
+	"reads a frontend's capabilities from its termination setting",
 	fn()
 		Test.expect(
-			ruleErrors(
-				capabilities({
-					port: 443,
-					mode: .http,
-					public: nil,
-					timeoutClient: nil,
-					tls: { certificate: "-----BEGIN CERTIFICATE-----\n", privateKey: "q" },
-				}),
-				[.sni("db.example.com")],
-				nil,
-				nil,
-			),
-		).toEqual([] as [Str]),
+			capabilities({
+				port: 443,
+				mode: .http,
+				public: nil,
+				timeoutClient: nil,
+				tls: .terminate,
+			}),
+		).toEqual({ mode: .http, terminatesTls: true } as Capabilities),
 )
 
 @test
 Test.it(
-	"rejects a tls certificate that is not PEM",
+	"rejects a rule certificate on a frontend that does not terminate TLS",
 	fn()
 		Test.expect(
 			fn()
-				Proxy({
-					name: "bad-tls",
-					replicas: 1,
-					replica: { cpu: 500, memory: 1024 * 32 },
-					frontends: #{
-						.https: {
-							port: 443,
-							mode: .http,
-							tls: { certificate: "./cert.pem", privateKey: "q" },
-						},
-					},
+				i.Rule({
+					frontend: .http,
+					matchers: [.host("plain.example.com")],
+					backends: [{ address: "my-host", port: 8080 }],
+					tls: { chain: "-----BEGIN CERTIFICATE-----\n", privateKey: "q" },
 				}),
-		).toRaise(InvalidOptions),
+		).toRaise(InvalidRule),
+)
+
+@test
+Test.it(
+	"rejects a rule certificate chain that is not PEM",
+	fn()
+		Test.expect(
+			fn()
+				i.Rule({
+					frontend: .https,
+					matchers: [.host("bad-pem.example.com")],
+					backends: [{ address: "my-host", port: 8080 }],
+					tls: { chain: "./cert.pem", privateKey: "q" },
+				}),
+		).toRaise(InvalidRule),
 )

@@ -66,9 +66,23 @@ export type Config {
 		statements: [ConfigStatement]?,
 	}},
 	backends: #{Str: [ConfigStatement]},
-	/// Certificates to deliver to the pods, keyed by the name a `bind`'s `crt`
-	/// argument refers to them by (see `certificatePath`).
+	/// Certificates to deliver to the pods, keyed by the name the certificate
+	/// lists below refer to them by.
 	certificates: #{Str: Certificate}?,
+	/// The certificate lists to write, keyed by the name a `bind`'s `crt-list`
+	/// argument refers to them by (see `certificateListPath`). A list may be
+	/// empty: a bind that declares `strict-sni` and finds no certificate is a
+	/// warning, not an error, and simply fails every handshake until one
+	/// arrives.
+	certificateLists: #{Str: [CertificateListEntry]}?,
+}
+
+/// One line of a certificate list: a certificate, and the SNI names that
+/// select it. Absent any filter, the client's SNI is matched against the CN
+/// and SANs the certificate itself carries.
+export type CertificateListEntry {
+	certificate: Str,
+	sniFilters: [Str],
 }
 
 /// Where the config volume — which carries the certificates too — is mounted.
@@ -82,10 +96,26 @@ let haproxyUser = 99
 /// A certificate's path within the config volume.
 let certificateFile = fn(name: Str) "tls/{name}.pem"
 
-/// The path a `bind ... ssl crt` argument names certificate `name` by. The
-/// private key is not in this file: HAProxy loads it from the `.key` beside
-/// it, which is how a key that never enters SCL still reaches the same bind.
+/// The path a certificate list names certificate `name` by. The private key is
+/// not in this file: HAProxy loads it from the `.key` beside it, which is how a
+/// key that never enters SCL still reaches the same bind.
 export let certificatePath = fn(name: Str) "{configMountPath}/{certificateFile(name)}"
+
+/// A certificate list's path within the config volume.
+let certificateListFile = fn(name: Str) "tls/{name}.list"
+
+/// The path a `bind ... ssl crt-list` argument names list `name` by.
+export let certificateListPath = fn(name: Str) "{configMountPath}/{certificateListFile(name)}"
+
+/// One line per certificate: where it is, then the SNI names selecting it.
+/// The paths are absolute because HAProxy resolves a relative crt-list entry
+/// against its own working directory rather than the list's own location, and
+/// so would not find the certificate sitting beside it.
+let formatCertificateList: fn([CertificateListEntry]) Str = fn(entries)
+	Str.join(
+		[for (e in entries) Str.join([certificatePath(e.certificate), in e.sniFilters], " ")],
+		"\n",
+	) + "\n"
 
 export type PodOptions {
 	name: Str,
@@ -130,7 +160,7 @@ export let configSections: fn(Config) [ConfigSection] = fn(config)
 export let Proxy = fn(config: Config)
 	let formattedConfig = formatConfig({ sections: configSections(config) });
 	let certificates = config.certificates ?? #{};
-	let terminatesTls = !Dict.isEmpty(certificates);
+	let hasSecrets = !Dict.isEmpty(certificates);
 	// One volume, so a rotated key or a rewritten config reaches the pods the
 	// same way. It is mounted writable (below), which is what makes either
 	// change recreate the replicas — HAProxy reads its config and loads its
@@ -139,6 +169,8 @@ export let Proxy = fn(config: Config)
 	let configVolume = C.ephemeralVolume({
 		files: #{
 			"haproxy.cfg": .literal(formattedConfig),
+			for (e in Dict.entries(config.certificateLists ?? #{}))
+				certificateListFile(e.key): .literal(formatCertificateList(e.value)),
 			for (e in Dict.entries(certificates))
 				certificateFile(e.key): .literal(e.value.certificatePem),
 			for (e in Dict.entries(certificates))
@@ -173,8 +205,8 @@ export let Proxy = fn(config: Config)
 								// image runs as — otherwise HAProxy can read
 								// neither its key nor, since one volume is one
 								// directory, its own config.
-								userId: if (terminatesTls) haproxyUser,
-								groupId: if (terminatesTls) haproxyUser,
+								userId: if (hasSecrets) haproxyUser,
+								groupId: if (hasSecrets) haproxyUser,
 							},
 						},
 					},
