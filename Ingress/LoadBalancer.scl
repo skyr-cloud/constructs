@@ -1,7 +1,6 @@
 import Self/Internal/HAProxy
 import Skyr/Resource
 import Skyr/Container
-import Skyr/Rollout
 import Std/Dict
 import Std/List
 import Std/Plugin
@@ -57,8 +56,6 @@ export type IngressOptions<TFrontend> {
 	name: Str,
 	region: Str?,
 	replicas: Int,
-	maxSurge: Int?,
-	maxUnavailable: Int?,
 	replica: {
 		cpu: Int,
 		memory: Int,
@@ -530,22 +527,18 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 			rules,
 		}),
 	);
-	let rs = Rollout.ReplicaSet({
-		name: opts.name,
-		count: opts.replicas,
-		maxSurge: opts.maxSurge,
-		maxUnavailable: opts.maxUnavailable,
-		replica: fn(r)
+	let addresses = [
+		for (i in List.range(opts.replicas))
 			proxy.Pod({
-				name: "{opts.name}-{r.rev}",
+				name: "{opts.name}-{i}",
 				region: opts.region,
 				cpu: opts.replica.cpu,
 				memory: opts.replica.memory,
 				networks: opts.networks,
 			}),
-	});
+	];
 	{
-		addresses: rs.replicas,
+		addresses,
 		Rule: fn(ruleOpts)
 			switch opts.frontends[ruleOpts.frontend]
 				case nil: raise InvalidRule("rule references unknown frontend {ruleOpts.frontend}")
