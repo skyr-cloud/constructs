@@ -2,6 +2,11 @@
 
 set -e
 
+if [[ -z "$SKYR_USERNAME" ]]; then
+  echo -e "Missing SKYR_USERNAME"
+  exit 1
+fi
+
 subreponame="${1/\//}"
 
 if [[ ! -d "$subreponame" ]]; then
@@ -20,6 +25,11 @@ echo "Created $deploydir"
 
 cd "$deploydir"
 
-git push --force skyr HEAD:main
+remoteurl="$SKYR_USERNAME@skyr.foo:Constructs/$subreponame"
+
+git remote add "$subreponame" "$remoteurl" 2>/dev/null \
+  || git remote set-url "$subreponame" "$remoteurl"
+git push --force "$subreponame" HEAD:main
+git remote remove "$subreponame"
 
 echo "Pushed $subreponame"
