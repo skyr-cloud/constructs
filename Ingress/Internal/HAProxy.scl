@@ -1,0 +1,186 @@
+import Std/List
+import Std/Str
+import Std/Test
+import Std/Dict
+import Skyr/Container as C
+
+export type ConfigFile {
+	sections: [ConfigSection],
+}
+
+export type ConfigSection {
+	heading: ConfigStatement,
+	statements: [ConfigStatement],
+}
+
+export type ConfigStatement {
+	tokens: [Str],
+	comment: Str?,
+}
+
+export let configBuilder = {
+	comment: fn(comment: Str) { comment, tokens: [] } as ConfigStatement,
+	statement: fn(tokens: Str) { tokens: Str.split(tokens, " ") } as ConfigStatement,
+	section: fn(heading: ConfigStatement, statements: [ConfigStatement])
+		{ heading, statements } as ConfigSection,
+}
+
+export let formatConfig: fn(ConfigFile) Str = fn(config)
+	Str.join(List.map(config.sections, formatSection), "\n\n") + "\n"
+
+let formatSection: fn(ConfigSection) Str = fn(section)
+	Str.join(
+		[
+			formatStatement(section.heading),
+			for (statement in section.statements) "\t" + formatStatement(statement),
+		],
+		"\n",
+	)
+
+let formatStatement: fn(ConfigStatement) Str = fn(stmt)
+	let line = Str.join(stmt.tokens, " ");
+	if (stmt.comment != nil)
+		if (line == "")
+			"# {stmt.comment}"
+		else
+			"{line} # {stmt.comment}"
+	else
+		line
+
+export type Config {
+	version: Str,
+	extraSections: [ConfigSection]?,
+	frontends: #{Str: {
+		bind: Int,
+		bindArgs: ConfigStatement?,
+		public: Bool?,
+		statements: [ConfigStatement]?,
+	}},
+	backends: #{Str: [ConfigStatement]},
+}
+
+export type PodOptions {
+	name: Str,
+	cpu: Int,
+	memory: Int,
+	region: Str?,
+	withPublicIPv4: Bool?,
+	networks: #{Str: C.Network}?,
+}
+
+export let configSections: fn(Config) [ConfigSection] = fn(config)
+	[
+		if (config.extraSections != nil)
+			in config.extraSections,
+		// frontend sections
+		for (feEntry in Dict.entries(config.frontends))
+			{
+				heading: configBuilder.statement("frontend {feEntry.key}"),
+				statements: [
+					{
+						tokens: [
+							"bind",
+							"*:{feEntry.value.bind}",
+							if (feEntry.value.bindArgs != nil)
+								in feEntry.value.bindArgs.tokens,
+						],
+						comment: if (feEntry.value.bindArgs != nil)
+							feEntry.value.bindArgs.comment,
+					},
+					if (feEntry.value.statements != nil)
+						in feEntry.value.statements,
+				],
+			},
+		// backend sections
+		for (beEntry in Dict.entries(config.backends))
+			{
+				heading: configBuilder.statement("backend {beEntry.key}"),
+				statements: beEntry.value,
+			},
+	]
+
+export let Proxy = fn(config: Config)
+	let formattedConfig = formatConfig({ sections: configSections(config) });
+	let configVolume = C.ephemeralVolume({
+		files: #{
+			"haproxy.cfg": .literal(formattedConfig),
+		},
+	});
+	let image = "haproxy:{config.version}-alpine";
+	{
+		formattedConfig,
+		Pod: fn(opts: PodOptions)
+			let internetAddress = if (opts.withPublicIPv4 ?? false)
+				C.InternetAddress({
+					name: opts.name,
+					region: opts.region,
+				});
+			let pod = C.Pod({
+				region: opts.region,
+				name: opts.name,
+				internetAddress,
+				networks: opts.networks,
+				containers: #{
+					"haproxy": {
+						image,
+						cpu: opts.cpu,
+						memory: opts.memory,
+						mounts: #{
+							"/usr/local/etc/haproxy": {
+								volume: configVolume,
+							},
+						},
+					},
+				},
+			});
+			with (
+				[
+					for (fe in Dict.values(config.frontends))
+						pod.Port({ port: fe.bind, public: fe.public ?? true }),
+				]
+			)
+				{
+					ipv4: if (internetAddress != nil) internetAddress.address,
+					ipv6: pod.address,
+				},
+	}
+
+@test
+Test.group(
+	"HAProxy config format",
+	fn()
+		Test.it(
+			"formats a simple config",
+			fn()
+				let b = configBuilder;
+				Test.expect(
+					formatConfig({
+						sections: [
+							b.section(
+								b.statement("global"),
+								[b.statement("daemon"), b.statement("maxconn 256")],
+							),
+							b.section(
+								b.statement("defaults"),
+								[
+									b.statement("mode http"),
+									b.statement("timeout connect 5000ms"),
+									b.statement("timeout client 50000ms"),
+									b.statement("timeout server 50000ms"),
+								],
+							),
+							b.section(
+								b.statement("frontend http-in"),
+								[b.statement("bind *:80"), b.statement("default_backend servers")],
+							),
+							b.section(
+								b.statement("backend servers"),
+								[b.statement("server server1 127.0.0.1:8000 maxconn 32")],
+							),
+						],
+					}),
+				).toEqual(
+					"global\n\tdaemon\n\tmaxconn 256\n\ndefaults\n\tmode http\n\ttimeout connect 5000ms\n\ttimeout client 50000ms\n\ttimeout server 50000ms\n\nfrontend http-in\n\tbind *:80\n\tdefault_backend servers\n\nbackend servers\n\tserver server1 127.0.0.1:8000 maxconn 32\n",
+				),
+		),
+)
