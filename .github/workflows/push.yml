@@ -1,0 +1,42 @@
+name: Push
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: push
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git subtree split walks the full history, and only a complete
+          # clone makes the split commits reproducible between runs.
+          fetch-depth: 0
+
+      - name: Configure SSH
+        env:
+          SKYR_SSH_KEY: ${{ secrets.SKYR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SKYR_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan skyr.foo >> ~/.ssh/known_hosts
+
+      - name: Push subrepos
+        env:
+          # The Constructs/Governance service account's QID, percent-encoded
+          # to pass as the SSH username of an scp-style remote.
+          SKYR_USERNAME: Constructs%2FGovernance%3A%3Amain%3A%3Astockholm%3ASkyr%2FIAM.ServiceAccount%3AGitHubActions
+        run: |
+          for dir in */; do
+            subreponame="${dir%/}"
+            echo "Pushing $subreponame"
+            git push --force \
+              "$SKYR_USERNAME@skyr.foo:Constructs/$subreponame" \
+              "$(git subtree split --prefix="$subreponame"):refs/heads/main"
+            echo "Pushed $subreponame"
+          done
