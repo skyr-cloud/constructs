@@ -19,3 +19,20 @@ IAM.Role({
 	name: "ConstructPackage",
 	description: "The deployment role for repositories that only contain constructs.",
 })
+
+let pusher = IAM.Role({
+	name: "Pusher",
+	description: "Can push to every repository in the organization.",
+})
+
+IAM.Policy({
+	name: "push-all-repos",
+	subjects: [pusher.qid],
+	verbs: ["environment:Create", "environment:Push"],
+	objects: ["Constructs/*"],
+})
+
+IAM.ServiceAccount({
+	name: "GitHubActions",
+	role: pusher.qid,
+})
