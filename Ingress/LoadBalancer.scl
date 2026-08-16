@@ -564,6 +564,20 @@ let backendStatements = fn(mode: Mode, rule: PreparedRule)
 			),
 	]
 
+/// The resolvers section every backend server resolves its address through.
+///
+/// A `server` line naming a host resolves it once, through libc, as the
+/// process starts, and never again — so a rollout that moves a name onto fresh
+/// replicas leaves the proxy dialing an address nobody answers on until it is
+/// restarted. Pointing the servers at a resolvers section is what turns that
+/// one-shot lookup into a periodic one; a section nothing references does
+/// nothing at all.
+///
+/// The record's own TTL is ignored either way — HAProxy re-resolves on its own
+/// `timeout resolve`, which defaults to a second, and again whenever a health
+/// check times out connecting, on the theory that the address may have moved.
+let resolversName = "internal"
+
 let baseSections = fn(t: { connectMs: Int, clientMs: Int, serverMs: Int })
 	let b = HAProxy.configBuilder;
 	[
@@ -571,11 +585,21 @@ let baseSections = fn(t: { connectMs: Int, clientMs: Int, serverMs: Int })
 			b.statement("global"),
 			[b.statement("log stdout format raw local0 info"), b.statement("maxconn 4096")],
 		),
+		// Whichever nameservers the platform already handed the pod: their
+		// addresses appear nowhere in SCL, and this is the same file the startup
+		// resolution reads regardless.
+		b.section(b.statement("resolvers {resolversName}"), [b.statement("parse-resolv-conf")]),
 		b.section(
 			b.statement("defaults"),
 			[
 				b.statement("log global"),
-				b.statement("default-server inter 2s fall 3 rise 2"),
+				// `last,none` rather than the default `last,libc`: mixing libc's
+				// startup resolution with runtime DNS is what the manual warns
+				// against, and `none` lets a replica boot with the server down
+				// instead of refusing to start over a name that has yet to exist.
+				b.statement(
+					"default-server inter 2s fall 3 rise 2 resolvers {resolversName} init-addr last,none",
+				),
 				b.statement("timeout connect {t.connectMs}"),
 				b.statement("timeout client {t.clientMs}"),
 				b.statement("timeout server {t.serverMs}"),
@@ -1010,7 +1034,7 @@ Test.group(
 					rules: [],
 				});
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind *:80 mss 1220\n\tmode http\n\toption httplog\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind *:80 mss 1220\n\tmode http\n\toption httplog\n",
 				),
 		);
 		Test.it(
@@ -1085,7 +1109,7 @@ Test.group(
 					"h2,http/1.1",
 				]);
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
 				),
 		);
 		Test.it(
