@@ -95,6 +95,7 @@ export type IngressOptions<TFrontend> {
 	replica: {
 		cpu: Int,
 		memory: Int,
+		ipv4: Bool?,
 	},
 	timeouts: Timeouts?,
 	frontends: #{TFrontend: FrontendOptions},
@@ -732,6 +733,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 				cpu: opts.replica.cpu,
 				memory: opts.replica.memory,
 				networks: #{ "ing0": network },
+				withPublicIPv4: opts.replica.ipv4,
 			}),
 	];
 	{
