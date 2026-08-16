@@ -477,6 +477,22 @@ let ruleRouting = fn(r: RoutedRule)
 			]
 		case winner: [b.comment("be-{r.rule.hash} shadowed by be-{winner} (identical matchers)")]
 
+/// The MSS every bind advertises, capping what a replica puts on the wire in
+/// one segment.
+///
+/// Replicas are reached over IPv6, which no router fragments in flight: a
+/// sender that overshoots the path MTU learns of it only from an ICMPv6 Packet
+/// Too Big coming back, and retransmits the same oversized segment forever if
+/// one never does. Nothing here can make that message arrive, so the segments
+/// are kept small enough that none is needed — 1220 is the 1280-byte IPv6
+/// minimum MTU less the 40-byte IPv6 and 20-byte TCP headers, a size every
+/// path must carry.
+///
+/// It goes on every bind, not just a terminating one. A handshake's
+/// certificate flight is merely the first response large enough to notice; a
+/// proxied page is the next.
+let clampedMss = 1220
+
 let frontendSection = fn(
 	fe: FrontendSpec,
 	routed: [RoutedRule],
@@ -494,13 +510,18 @@ let frontendSection = fn(
 		// happens to lead the list. ALPN is offered only where the frontend
 		// speaks HTTP itself — a terminating tcp frontend hands the plaintext
 		// on untouched, so it has no protocol to negotiate for the client.
-		bindArgs: if (fe.terminatesTls)
-			b.statement(
-				if (fe.mode == .http)
-					"ssl crt-list {HAProxy.certificateListPath(fe.name)} strict-sni alpn h2,http/1.1"
-				else
-					"ssl crt-list {HAProxy.certificateListPath(fe.name)} strict-sni",
+		bindArgs: b.statement(
+			Str.join(
+				[
+					"mss {clampedMss}",
+					if (fe.terminatesTls)
+						"ssl crt-list {HAProxy.certificateListPath(fe.name)} strict-sni",
+					if (fe.terminatesTls && fe.mode == .http)
+						"alpn h2,http/1.1",
+				],
+				" ",
 			),
+		),
 		public: fe.public,
 		statements: [
 			b.statement("mode {fe.mode}"),
@@ -989,7 +1010,7 @@ Test.group(
 					rules: [],
 				});
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind *:80\n\tmode http\n\toption httplog\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind *:80 mss 1220\n\tmode http\n\toption httplog\n",
 				),
 		);
 		Test.it(
@@ -1054,6 +1075,8 @@ Test.group(
 					rules: [testCertRule("r1", "https", [.host("example.com")])],
 				});
 				Test.expect(config.frontends["https"]?.bindArgs?.tokens).toEqual([
+					"mss",
+					"1220",
 					"ssl",
 					"crt-list",
 					"/usr/local/etc/haproxy/tls/https.list",
@@ -1062,7 +1085,7 @@ Test.group(
 					"h2,http/1.1",
 				]);
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
 				),
 		);
 		Test.it(
@@ -1075,6 +1098,8 @@ Test.group(
 					rules: [],
 				});
 				Test.expect(config.frontends["tls"]?.bindArgs?.tokens).toEqual([
+					"mss",
+					"1220",
 					"ssl",
 					"crt-list",
 					"/usr/local/etc/haproxy/tls/tls.list",
@@ -1234,7 +1259,7 @@ Test.group(
 				]),
 		);
 		Test.it(
-			"leaves a frontend that does not terminate without bind arguments",
+			"leaves a frontend that does not terminate without TLS bind arguments",
 			fn()
 				let config = buildConfig({
 					version: "3.4",
@@ -1242,7 +1267,9 @@ Test.group(
 					frontends: [testFe("http", 80, .http), testTlsFe("https", 443, .http)],
 					rules: [testCertRule("r1", "https", [.host("example.com")])],
 				});
-				Test.expect(config.frontends["http"]?.bindArgs).toEqual(nil);
+				// The MSS clamp is not TLS material: it is on every bind, and is
+				// all a cleartext one carries.
+				Test.expect(config.frontends["http"]?.bindArgs?.tokens).toEqual(["mss", "1220"]);
 				Test.expect(Dict.keys(config.certificateLists ?? #{})).toEqual(["https"]);
 				Test.expect((config.certificates ?? #{})["cert-r1"]?.privateKeyQid).toEqual(
 					"org/repo!k@1",
