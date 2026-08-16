@@ -61,9 +61,10 @@ export type Tls enum { .terminate }
 /// A certificate a rule brings for the hostnames it serves. Provisioning it is
 /// somebody else's job: this is only what a bind needs to present it.
 export type Certificate {
-	/// The PEM-encoded certificate chain, leaf first. It is public material,
-	/// so it travels as text.
-	chain: Str,
+	/// The PEM-encoded chain, leaf certificate first — the bind pairs the
+	/// private key with whichever certificate leads it. Public material, so it
+	/// travels as text.
+	fullChain: Str,
 	/// The Secret Version QID of the matching PEM-encoded private key —
 	/// `Secret.get("my-tls-key").qid` at the call site. The plaintext is
 	/// resolved inside the platform when a replica materializes, so it enters
@@ -196,7 +197,7 @@ let certificateErrors = fn(caps: Capabilities, tls: Certificate?)
 		case cert: [
 			if (!caps.terminatesTls)
 				"a rule certificate needs a frontend that terminates TLS",
-			if (!Str.startsWith(cert.chain, "-----BEGIN "))
+			if (!Str.startsWith(cert.fullChain, "-----BEGIN "))
 				"a rule certificate chain must be PEM-encoded",
 			if (Str.isEmpty(cert.privateKey))
 				"a rule certificate needs the secret version qid of its private key",
@@ -708,7 +709,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 				checkIntervalMs: hc.intervalMs,
 				certificate: switch rule.tls
 					case nil: nil
-					case cert: { certificatePem: cert.chain, privateKeyQid: cert.privateKey },
+					case cert: { certificatePem: cert.fullChain, privateKeyQid: cert.privateKey },
 			},
 	];
 	let proxy = HAProxy.Proxy(
@@ -1422,7 +1423,7 @@ i.Rule({
 	// In a deployment the key is `Secret.get("my-tls-key").qid`; a test run
 	// resolves no secrets, so it stands in as a literal qid here.
 	tls: {
-		chain: "-----BEGIN CERTIFICATE-----\n",
+		fullChain: "-----BEGIN CERTIFICATE-----\n",
 		privateKey: "my-org/my-repo!my-tls-key@abc",
 	},
 })
@@ -1491,7 +1492,7 @@ Test.it(
 					frontend: .http,
 					matchers: [.host("plain.example.com")],
 					backends: [{ address: "my-host", port: 8080 }],
-					tls: { chain: "-----BEGIN CERTIFICATE-----\n", privateKey: "q" },
+					tls: { fullChain: "-----BEGIN CERTIFICATE-----\n", privateKey: "q" },
 				}),
 		).toRaise(InvalidRule),
 )
@@ -1506,7 +1507,7 @@ Test.it(
 					frontend: .https,
 					matchers: [.host("bad-pem.example.com")],
 					backends: [{ address: "my-host", port: 8080 }],
-					tls: { chain: "./cert.pem", privateKey: "q" },
+					tls: { fullChain: "./cert.pem", privateKey: "q" },
 				}),
 		).toRaise(InvalidRule),
 )
