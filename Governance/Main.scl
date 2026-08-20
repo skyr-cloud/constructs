@@ -1,11 +1,19 @@
 import Skyr/IAM
 
 IAM.Policy({
-	name: "public-repos",
+	name: "public-org",
 	subjects: ["Anonymous"],
 	verbs: [
 		"organization:View",
 		"organization:ListRepositories",
+	],
+	objects: ["Constructs"],
+})
+
+IAM.Policy({
+	name: "public-repos",
+	subjects: ["Anonymous"],
+	verbs: [
 		"repository:View",
 		"repository:ListEnvironments",
 		"environment:View",
