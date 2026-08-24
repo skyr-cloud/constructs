@@ -112,24 +112,15 @@ export let InvalidOptions = exception(Str)
 
 export let InvalidRule = exception(Str)
 
-/// The millisecond value of a positive, linear duration; nil otherwise.
-/// A calendar-month component has no fixed length, so it cannot configure
-/// HAProxy timers.
-let linearMs: fn(Time.Duration) Int? = fn(d)
-	if ((d.months ?? 0) != 0)
-		nil
-	else if ((d.milliseconds ?? 0) > 0)
-		d.milliseconds
-
 let msOr = fn(d: Time.Duration?, fallback: Int)
 	switch d
 		case nil: fallback
-		case dur: linearMs(dur) ?? fallback
+		case .millisecondDelta(d): d
 
 let msOrNil = fn(d: Time.Duration?)
 	switch d
 		case nil: nil
-		case dur: linearMs(dur)
+		case .millisecondDelta(d): d
 
 /// What a frontend's configuration lets its rules do. Carried instead of the
 /// bare mode so that terminating TLS widens what a rule may ask for without
@@ -151,15 +142,6 @@ let hasTlsVisibility = fn(c: Capabilities) c.mode == .tcp || c.terminatesTls
 /// Whether SNI has to be recovered by inspecting the ClientHello, which is
 /// what a passthrough frontend does and a terminating one must not.
 let inspectsClientHello = fn(c: Capabilities) c.mode == .tcp && !c.terminatesTls
-
-let durationErrors = fn(d: Time.Duration?, what: Str)
-	switch d
-		case nil: [] as [Str]
-		case dur:
-			if (linearMs(dur) == nil)
-				["{what} must be a positive millisecond-valued duration"]
-			else
-				[]
 
 let matcherModeErrors = fn(caps: Capabilities, m: Matcher)
 	switch m
@@ -240,8 +222,6 @@ let ruleErrors = fn(
 			case nil: [] as [Str]
 			case hc: [
 				in probeModeErrors(caps, hc.probe),
-				if (linearMs(hc.interval) == nil)
-					"the health check interval must be a positive millisecond-valued duration",
 				in switch hc.probe
 					case .connect: [] as [Str]
 					case .http(path):
@@ -249,12 +229,6 @@ let ruleErrors = fn(
 							[]
 						else
 							["the http probe path {path} must start with /"],
-			],
-		in switch timeouts
-			case nil: [] as [Str]
-			case t: [
-				in durationErrors(t.connect, "the connect timeout"),
-				in durationErrors(t.server, "the server timeout"),
 			],
 	]
 
@@ -702,24 +676,9 @@ let ruleTimeoutMs = fn(t: RuleTimeouts?)
 let preparedCheck = fn(hc: HealthCheck?)
 	switch hc
 		case nil: { probe: .connect, intervalMs: 2000 }
-		case h: { probe: h.probe, intervalMs: linearMs(h.interval) ?? 2000 }
+		case h: { probe: h.probe, intervalMs: Time.toMilliseconds(h.interval) }
 
-export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
-	let optionErrors = [
-		in switch opts.timeouts
-			case nil: [] as [Str]
-			case t: [
-				in durationErrors(t.connect, "timeouts.connect"),
-				in durationErrors(t.client, "timeouts.client"),
-				in durationErrors(t.server, "timeouts.server"),
-			],
-		for (fe in Dict.entries(opts.frontends))
-			in durationErrors(fe.value.timeoutClient, "frontend {fe.key} timeoutClient"),
-	];
-	(
-		if (!List.isEmpty(optionErrors))
-			raise InvalidOptions(Str.join(optionErrors, "; "))
-	);
+export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 	let resolvedTimeouts = switch opts.timeouts
 		case nil: { connectMs: 5000, clientMs: 30000, serverMs: 30000 }
 		case t:
@@ -805,7 +764,6 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>) (
 								qid: rule.qid,
 							},
 	} as Ingress<TFrontend>
-)
 
 @test import Std/Test
 
@@ -875,32 +833,6 @@ let useBackends = fn(statements: [HAProxy.ConfigStatement]?)
 			if (Str.startsWith(l, "use_backend"))
 				l,
 	]
-
-@test
-Test.group(
-	"linearMs",
-	fn()
-		Test.it(
-			"accepts a positive millisecond duration",
-			fn()
-				Test.expect(linearMs(Time.multiply(Time.second, 30))).toEqual(30000),
-		);
-		Test.it(
-			"rejects a calendar-month duration",
-			fn()
-				Test.expect(linearMs(Time.month)).toEqual(nil),
-		);
-		Test.it(
-			"rejects an empty duration",
-			fn()
-				Test.expect(linearMs({ months: nil, milliseconds: nil })).toEqual(nil),
-		);
-		Test.it(
-			"rejects a non-positive duration",
-			fn()
-				Test.expect(linearMs({ months: nil, milliseconds: 0 })).toEqual(nil),
-		),
-)
 
 @test
 Test.group(
@@ -976,34 +908,6 @@ Test.group(
 						nil,
 					),
 				).toEqual([] as [Str]),
-		);
-		Test.it(
-			"rejects a non-linear health check interval",
-			fn()
-				Test.expect(
-					ruleErrors(
-						plaintext,
-						[.host("example.com")],
-						nil,
-						{ interval: Time.month, probe: .connect },
-						nil,
-					),
-				).toEqual([
-					"the health check interval must be a positive millisecond-valued duration",
-				]),
-		);
-		Test.it(
-			"rejects a non-linear rule timeout",
-			fn()
-				Test.expect(
-					ruleErrors(
-						plaintext,
-						[.host("example.com")],
-						{ connect: Time.month, server: nil },
-						nil,
-						nil,
-					),
-				).toEqual(["the connect timeout must be a positive millisecond-valued duration"]),
 		);
 		Test.it(
 			"accepts a valid http rule",
