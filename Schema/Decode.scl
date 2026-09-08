@@ -44,6 +44,12 @@ export type Segment enum { .field(Str), .index(Int) }
 
 /// Everything a rejected value is rejected for.
 export type Error {
+	/// The whole failure as one sentence — exactly what
+	/// [`formatError`](#formaterror) writes for the three fields below. It is
+	/// carried in the record because an exception nobody catches is reported as
+	/// a dump of its payload, and the sentence has to be inside that dump for
+	/// anyone to read it there.
+	message: Str,
 	/// The way from the root of the value the outermost decoder was applied to
 	/// down to the offending one. Empty when the root itself is the offender.
 	path: [Segment],
@@ -78,7 +84,17 @@ let truncate = fn(text: Str)
 	else
 		text
 
-let quoted = fn(text: Str) "\"{text}\""
+/// Write a string the way SCL writes one nested inside a value: wrapped in
+/// quotes, with the characters that would end it or break the line spelled out.
+/// A rendered value is then always one unambiguous line, and a string reads the
+/// same alone as it does inside a list.
+let quoted = fn(text: Str)
+	let backslashes = Str.replace(text, "\\", "\\\\");
+	let quotes = Str.replace(backslashes, "\"", "\\\"");
+	let newlines = Str.replace(quotes, "\n", "\\n");
+	let returns = Str.replace(newlines, "\r", "\\r");
+	let tabs = Str.replace(returns, "\t", "\\t");
+	"\"{tabs}\""
 
 /// Write a dynamic value the way an error message should show it: a string
 /// quoted, so an empty or space-padded one is still visible, and everything
@@ -96,10 +112,16 @@ let renderExactly = fn(value: Any)
 
 let render = fn(value: Any) truncate(renderExactly(value))
 
+/// An error over its three parts, with the sentence they read as filled in.
+/// Everything that builds or re-paths an error goes through here, so `message`
+/// is never left behind by a path the error grew after it was raised.
+let errorFor = fn(path: [Segment], expected: Str, actual: Str)
+	{ message: formatFields(path, expected, actual), path, expected, actual } as Error
+
 /// The error a value gets when it is rejected where it stands, before any
 /// combinator has had the chance to say where that is.
 let rootError = fn(expected: Str, value: Any)
-	{ path: [] as [Segment], expected, actual: render(value) } as Error
+	errorFor([] as [Segment], expected, render(value))
 
 /// Reject `value`, saying what was expected in its place.
 ///
@@ -115,17 +137,17 @@ let rootError = fn(expected: Str, value: Any)
 /// ```
 export let fail = fn(expected: Str, value: Any) raise DecodeError(rootError(expected, value))
 
-/// What a bare `Std/Dyn` cast is reported to have wanted when it refuses a
-/// value. The cast knows which type it was after, but says so only in the prose
-/// of its exception, so a decoder built out of this module's own combinators —
-/// each of which names the type it wanted — always reads better than one built
-/// out of `Dyn.as*` directly.
-let castMismatch = "a different type"
+/// What a bare `Std/Dyn` cast wanted, for an error raised in place of the one
+/// it raised itself. The cast names the type it was after only in the prose of
+/// its exception, so that prose is carried through unread rather than taken
+/// apart. A decoder built from this module's own combinators, each of which
+/// names its type outright, still reads better.
+let castMismatch = fn(message: Str) "the type a Std/Dyn cast wanted ({message})"
 
 /// The error `error` turns into once it is known to be about the child at
 /// `segment` rather than about a value of its own.
 let errorAt = fn(segment: Segment, error: Error)
-	{ path: [segment, in error.path], expected: error.expected, actual: error.actual } as Error
+	errorFor([segment, in error.path], error.expected, error.actual)
 
 /// Decode the child at `segment` of the value being decoded, so a failure
 /// underneath reports the whole path rather than the part of it the child could
@@ -137,7 +159,9 @@ let errorAt = fn(segment: Segment, error: Error)
 let at = fn<T>(segment: Segment, value: Any, decode: Decoder<T>)
 	try decode(value)
 	catch DecodeError(e): raise DecodeError(errorAt(segment, e))
-	catch Dyn.UnexpectedType(_): raise DecodeError(errorAt(segment, rootError(castMismatch, value)))
+	catch Dyn.UnexpectedType(message): raise DecodeError(
+		errorAt(segment, rootError(castMismatch(message), value)),
+	)
 
 /// A decoder that hands the value to one `Std/Dyn` cast and reports `expected`
 /// when the cast refuses it.
@@ -157,7 +181,10 @@ export let str: Decoder<Str> = casting("Str", Dyn.asStr)
 /// Decode a boolean.
 export let bool: Decoder<Bool> = casting("Bool", Dyn.asBool)
 
-/// The magnitude at which a `Float` stops fitting in an `Int`.
+/// A bound kept safely under the largest `Int`, which is a little over
+/// `9.223e18`. Rounding a `Float` below this can never overflow, and an overflow
+/// would trap and end the evaluation rather than reject the value; the trade is
+/// that a whole number between this bound and the true maximum is refused.
 let intLimit = Num.toFloat(9000000000000000000)
 
 /// The `Int` a `Float` stands for, or a mismatch when it stands for none.
@@ -219,7 +246,7 @@ let formatSegment = fn(segment: Segment)
 			if (isIdentifier(name))
 				".{name}"
 			else
-				"[\"{name}\"]"
+				"[{quoted(name)}]"
 		case .index(index): "[{index}]"
 
 /// Write a path the way a reader would index into the document: `$` on its own
@@ -233,33 +260,42 @@ let formatSegment = fn(segment: Segment)
 export let formatPath = fn(path: [Segment])
 	"$" + Str.join([for (segment in path) formatSegment(segment)], "")
 
+let formatFields = fn(path: [Segment], expected: Str, actual: Str)
+	"at {formatPath(path)}: expected {expected}, got {actual}"
+
 /// Write an error as one sentence, `at <path>: expected <expected>, got
-/// <actual>`, ready to be raised, logged, or joined with others.
+/// <actual>`. Every error carries this already as its
+/// [`message`](#type-error); this writes it again from the parts.
 ///
 /// ```scl
-/// Decode.formatError({ path: [.field("port")], expected: "Int", actual: "\"80\"" })
-/// // "at $.port: expected Int, got \"80\""
+/// try
+/// 	Decode.int(value)
+/// catch Decode.DecodeError(e):
+/// 	Decode.formatError(e)   // "at $.port: expected Int, got \"80\""
 /// ```
 export let formatError = fn(error: Error)
-	"at {formatPath(error.path)}: expected {error.expected}, got {error.actual}"
-
-@test
-let failureOf = fn<T>(decode: Decoder<T>, value: Any)
-	try {
-		path: [] as [Segment],
-		expected: "a rejected value",
-		actual: render(decode(value) as Any),
-	} as Error
-	catch DecodeError(e): e
+	formatFields(error.path, error.expected, error.actual)
 
 // The `Error` a decoder raised for a value, so a case can assert on the whole
 // payload at once. A decoder that accepts the value instead reports that, as an
 // error no decoder would raise.
 @test
-let atRoot = fn(expected: Str, actual: Str)
-	{ path: [] as [Segment], expected, actual } as Error
+let failureOf = fn<T>(decode: Decoder<T>, value: Any)
+	try errorFor([] as [Segment], "a rejected value", render(decode(value) as Any))
+	catch DecodeError(e): e
 
-// The `Error` a decoder raises for a value that fails where it stands.
+// The `Error` for a value that fails where it stands.
+@test let atRoot = fn(expected: Str, actual: Str) errorFor([] as [Segment], expected, actual)
+
+// The `Error` for a value that fails somewhere inside a larger one.
+@test let atPath = fn(path: [Segment], expected: Str, actual: Str) errorFor(path, expected, actual)
+
+// The message `Std/Dyn` itself raises when it refuses `value` as a string.
+@test
+let dynStrMessage = fn(value: Any)
+	try Dyn.asStr(value)
+	catch Dyn.UnexpectedType(message): message
+
 @test
 Test.group(
 	"str",
@@ -403,6 +439,28 @@ Test.group(
 
 @test
 Test.group(
+	"rendering a string that could be misread",
+	fn()
+		Test.it(
+			"spells out quotes, backslashes and newlines",
+			fn()
+				let awkward = "a\\b\nc\"d";
+				Test.expect(failureOf(int, awkward as Any)).toEqual(
+					atRoot("Int", "\"a\\\\b\\nc\\\"d\""),
+				),
+		);
+		Test.it(
+			"reads the same alone as it does inside a list",
+			fn()
+				let awkward = "a\\b\nc\"d\te\rf";
+				let alone = failureOf(int, awkward as Any).actual;
+				let inList = failureOf(int, [awkward] as Any).actual;
+				Test.expect(inList).toEqual("[{alone}]"),
+		),
+)
+
+@test
+Test.group(
 	"rendering a large value",
 	fn()
 		Test.it(
@@ -431,7 +489,7 @@ Test.group(
 			fn()
 				Test.expect(
 					failureOf(fn(v: Any) at(.field("port"), v, int), Encoding.fromJson("\"80\"")),
-				).toEqual({ path: [.field("port")], expected: "Int", actual: "\"80\"" } as Error),
+				).toEqual(atPath([.field("port")], "Int", "\"80\"")),
 		);
 		Test.it(
 			"builds the path from the inside out",
@@ -439,20 +497,27 @@ Test.group(
 				let inner = fn(v: Any) at(.field("port"), v, int);
 				Test.expect(
 					failureOf(fn(v: Any) at(.index(0), v, inner), Encoding.fromJson("\"80\"")),
-				).toEqual(
-					{
-						path: [.index(0), .field("port")],
-						expected: "Int",
-						actual: "\"80\"",
-					} as Error,
-				),
+				).toEqual(atPath([.index(0), .field("port")], "Int", "\"80\"")),
 		);
 		Test.it(
 			"turns a bare Std/Dyn cast into a decoder failure",
 			fn()
-				Test.expect(
-					failureOf(fn(v: Any) at(.index(2), v, Dyn.asStr), Encoding.fromJson("1")),
-				).toEqual({ path: [.index(2)], expected: castMismatch, actual: "1" } as Error),
+				let value = Encoding.fromJson("1");
+				let error = failureOf(fn(v: Any) at(.index(2), v, Dyn.asStr), value);
+				Test.expect(error.path).toEqual([.index(2)]);
+				Test.expect(error.actual).toEqual("1");
+				Test.expect(Str.contains(error.expected, dynStrMessage(value))).toEqual(true),
+		);
+		Test.it(
+			"keeps the sentence in step with the path it grew",
+			fn()
+				let inner = fn(v: Any) at(.field("port"), v, int);
+				let error = failureOf(
+					fn(v: Any) at(.index(0), v, inner),
+					Encoding.fromJson("\"80\""),
+				);
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $[0].port: expected Int, got \"80\""),
 		),
 )
 
@@ -478,6 +543,14 @@ Test.group(
 			fn() Test.expect(formatPath([.field("")])).toEqual("$[\"\"]"),
 		);
 		Test.it(
+			"escapes a key that would otherwise end its own quotes",
+			fn() Test.expect(formatPath([.field("a\"b")])).toEqual("$[\"a\\\"b\"]"),
+		);
+		Test.it(
+			"escapes a key that spans lines",
+			fn() Test.expect(formatPath([.field("a\nb")])).toEqual("$[\"a\\nb\"]"),
+		);
+		Test.it(
 			"writes an index in brackets",
 			fn()
 				Test.expect(formatPath([.field("servers"), .index(0), .field("port")])).toEqual(
@@ -495,11 +568,7 @@ Test.group(
 			fn()
 				Test.expect(
 					formatError(
-						{
-							path: [.field("servers"), .index(0), .field("port")],
-							expected: "Int",
-							actual: "\"80\"",
-						} as Error,
+						atPath([.field("servers"), .index(0), .field("port")], "Int", "\"80\""),
 					),
 				).toEqual("at $.servers[0].port: expected Int, got \"80\""),
 		);
