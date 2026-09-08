@@ -500,11 +500,6 @@ let casesOf = fn<T>(cases: #{Str: T})
 	let listed = Str.join(names, ", ");
 	if (List.isEmpty(names)) noCases else "one of [{listed}]"
 
-/// The string a value stands for, or a mismatch naming the cases there are.
-let caseName = fn(value: Any, expected: Str)
-	try Dyn.asStr(value)
-	catch Dyn.UnexpectedType(_): fail(expected, value)
-
 /// Decode one of a fixed set of strings into the value it stands for — the way
 /// a document writes what SCL holds as an enum. Anything that is not one of the
 /// strings the table names is rejected with all of them: `expected one of
@@ -526,8 +521,9 @@ let caseName = fn(value: Any, expected: Str)
 /// It is `choice` rather than `enum` because `enum` is a keyword.
 export let choice = fn<T>(cases: #{Str: T})
 	let expected = casesOf(cases);
+	let asName = casting(expected, Dyn.asStr);
 	fn(value: Any)
-		let name = caseName(value, expected);
+		let name = asName(value);
 		if (Dict.has(cases, name)) Option.unwrap(cases[name]) else fail(expected, value)
 
 let identifierStart = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
