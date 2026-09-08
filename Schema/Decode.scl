@@ -29,6 +29,7 @@ import Std/Dyn
 import Std/Float
 import Std/List
 import Std/Num
+import Std/Option
 import Std/Str
 @test import Std/Encoding
 @test import Std/Test
@@ -322,8 +323,9 @@ export type Field fn<U>(Str, Decoder<U>) U
 /// than a schema reads. A field the document does not carry is not a case of its
 /// own: the key reads as `nil`, exactly as indexing any dict with a missing key
 /// does, and the field's decoder rejects it — `at $.port: expected Int, got
-/// nil`. A field that is allowed to be missing or null says so in its decoder,
-/// which is where every other condition on a field is written too.
+/// nil`. A field that is allowed to be missing or null says so in its decoder —
+/// `field("tls", Decode.optional(Decode.bool))` — which is where every other
+/// condition on a field is written too.
 ///
 /// The builder's parameter has to be annotated [`Decode.Field`](#type-field);
 /// without the annotation every field is refused with `invalid type: Str is not
@@ -352,6 +354,212 @@ export let record = fn<T>(build: fn(Field) T)
 			at(.field(name), fields[name] as Any, decode);
 		build(readField)
 
+/// Decode a value that is allowed to be absent. A `nil` — a key the document
+/// does not carry, or one written as `null` — passes through as `nil`; anything
+/// else is decoded, and rejected on the same terms as ever.
+///
+/// This applies wherever a decoder does, not only to the field of a record: an
+/// element of a list may be optional too.
+///
+/// ```scl
+/// Decode.optional(Decode.bool)(Encoding.fromJson("null"))    // nil
+/// Decode.optional(Decode.bool)(Encoding.fromJson("true"))    // true
+/// ```
+export let optional = fn<T>(decode: Decoder<T>)
+	fn(value: Any) if (value == nil) nil as T? else decode(value)
+
+/// Decode a value that is allowed to be absent, standing in a fallback for it
+/// when it is. A `nil` gives the fallback; anything else is decoded, so a value
+/// of the wrong type is still a mismatch rather than quietly becoming the
+/// fallback.
+///
+/// ```scl
+/// Decode.withDefault(Decode.bool, false)(Encoding.fromJson("null"))   // false
+/// Decode.withDefault(Decode.bool, false)(Encoding.fromJson("true"))   // true
+/// ```
+export let withDefault = fn<T>(decode: Decoder<T>, fallback: T)
+	fn(value: Any) if (value == nil) fallback else decode(value)
+
+/// Decode a value and put what comes out through a function, for the times a
+/// document writes something in one shape and the program wants it in another.
+///
+/// ```scl
+/// Decode.map(Decode.str, Str.toUpper)(Encoding.fromJson("\"web\""))   // "WEB"
+/// ```
+export let map = fn<T, U>(decode: Decoder<T>, transform: fn(T) U)
+	fn(value: Any) transform(decode(value))
+
+/// Decode a value, then choose the decoder for the rest of it from what came
+/// out. This is how a shape that describes itself is read — a record whose
+/// `"kind"` says which other fields it has — and the chosen decoder reads the
+/// same value over again, so it sees the whole thing rather than what is left
+/// of it.
+///
+/// A failure raised by the chosen decoder keeps the path it was raised at: no
+/// segment is added here, because no step into the value was taken.
+///
+/// ```scl
+/// let kind = Decode.record(fn(field: Decode.Field) field("kind", Decode.str))
+///
+/// let endpoint = Decode.andThen(
+/// 	kind,
+/// 	fn(name: Str) if (name == "http") httpEndpoint else unixEndpoint,
+/// )
+/// ```
+export let andThen = fn<T, U>(decode: Decoder<T>, next: fn(T) Decoder<U>)
+	fn(value: Any) next(decode(value))(value)
+
+/// Decode a value and hold it to a condition the type alone cannot state. The
+/// decoder runs first; what it produced is then handed to `predicate`, and a
+/// `false` rejects it with `expected` as the phrase and the decoded value —
+/// not the one the document wrote — as what was found.
+///
+/// ```scl
+/// let port = Decode.refine(Decode.int, fn(n: Int) n >= 1 && n <= 65535, "port in 1..65535")
+///
+/// port(Encoding.fromJson("70000"))
+/// // raises: at $: expected port in 1..65535, got 70000
+/// ```
+export let refine = fn<T>(decode: Decoder<T>, predicate: fn(T) Bool, expected: Str)
+	fn(value: Any)
+		let decoded = decode(value);
+		if (predicate(decoded)) decoded else fail(expected, decoded as Any)
+
+/// Why one alternative refused a value, as it reads in a list of them all: the
+/// phrase it wanted, and where under the value it wanted it when that was not
+/// the value itself. The path is written from the value the alternatives were
+/// applied to, which is as far as any of them saw.
+let refusalPhrase = fn(error: Error)
+	if (List.isEmpty(error.path))
+		error.expected
+	else
+		"{error.expected} at {relativePath(error.path)}"
+
+/// What one alternative produced, kept in a list of its own so that an
+/// alternative which produced `nil` still counts as one that produced
+/// something.
+let decodedBy = fn<T>(value: T) { decoded: [value], refusal: nil as Str? }
+
+/// An alternative that produced nothing, and the phrase saying why.
+let refusedWith = fn<T>(phrase: Str) { decoded: [] as [T], refusal: phrase as Str? }
+
+/// What one alternative made of a value: what it decoded, or why it would not.
+let attemptOf = fn<T>(decode: Decoder<T>, value: Any)
+	try decodedBy(decode(value))
+	catch DecodeError(e): refusedWith<T>(refusalPhrase(e))
+	catch Dyn.UnexpectedType(message): refusedWith<T>(castMismatch(message))
+
+/// The phrase a value gets when it was offered to no alternative at all.
+let noAlternatives = "one of [] (no alternatives were given)"
+
+/// The phrase for a value every alternative refused: what each of them wanted,
+/// in the order they were written, bracketed so the list of them ends where the
+/// rest of the sentence begins.
+let refusedByAll = fn<T>(attempts: [{ decoded: [T], refusal: Str? }])
+	let refusals = List.flatMap(attempts, fn(attempt) Option.toList(attempt.refusal));
+	let listed = Str.join(refusals, ", ");
+	if (List.isEmpty(refusals)) noAlternatives else "one of [{listed}]"
+
+/// Decode a value that may be written in more than one way, all of them read as
+/// the same type. Every alternative is tried, and the first that accepts the
+/// value gives the result.
+///
+/// When none of them accepts it, the failure names what each of them wanted,
+/// and where it wanted it: `at $.address: expected one of [Str, Int at .port],
+/// got #{"port": "80"}`. A list with no alternatives in it accepts nothing, and
+/// says so.
+///
+/// ```scl
+/// Decode.oneOf([Decode.str, Decode.map(Decode.int, Num.toStr)])(Encoding.fromJson("8080"))
+/// // "8080"
+/// ```
+export let oneOf = fn<T>(alternatives: [Decoder<T>])
+	fn(value: Any)
+		let attempts = [for (decode in alternatives) attemptOf(decode, value)];
+		let decoded = List.flatMap(attempts, fn(attempt) attempt.decoded);
+		if (List.isEmpty(decoded))
+			fail(refusedByAll(attempts), value)
+		else
+			Option.unwrap(List.first(decoded))
+
+/// The characters a case name is put in order by, in the order they are put in:
+/// printable ASCII, which is what the names of a set of cases are written in.
+/// A character outside it ranks after all of them, and ties with every other
+/// such character, which leaves two names that differ only there in the order
+/// the table had them.
+let ordering = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz\{|}~"
+
+/// Where the character at `index` of `name` comes in that order, and before all
+/// of them when the name has ended.
+let rankIn = fn(name: Str, index: Int)
+	if (index >= Str.length(name))
+		-1
+	else
+		Option.default(
+			Str.indexOf(ordering, Str.slice(name, index, index + 1)),
+			Str.length(ordering),
+		)
+
+/// Whether `name` comes before `other`, compared from `index` onwards.
+let comesBefore = fn(name: Str, other: Str, index: Int)
+	if (index >= Str.length(name) && index >= Str.length(other))
+		false
+	else if (rankIn(name, index) == rankIn(other, index))
+		comesBefore(name, other, index + 1)
+	else
+		rankIn(name, index) < rankIn(other, index)
+
+/// `sorted` with `name` put where it belongs in it.
+let insertName = fn(sorted: [Str], name: Str)
+	[
+		in List.filter(sorted, fn(other: Str) comesBefore(other, name, 0)),
+		name,
+		in List.filter(sorted, fn(other: Str) !comesBefore(other, name, 0)),
+	]
+
+/// `rest` merged into `sorted`, one name at a time.
+let sortNames = fn(rest: [Str], sorted: [Str])
+	if (List.isEmpty(rest))
+		sorted
+	else
+		sortNames(List.skip(rest, 1), insertName(sorted, Option.unwrap(List.first(rest))))
+
+/// The phrase a value gets when it names no case of a table with no cases.
+let noCases = "one of nothing (no cases were given)"
+
+/// The phrase naming the strings a table accepts. They are put in order rather
+/// than listed as the table holds them, so that the same set of cases reads the
+/// same way however the table was built.
+let casesOf = fn<T>(cases: #{Str: T})
+	let names = [for (name in sortNames(Dict.keys(cases), [] as [Str])) quoted(name)];
+	let listed = Str.join(names, ", ");
+	if (List.isEmpty(names)) noCases else "one of {listed}"
+
+/// The string a value stands for, or a mismatch naming the cases there are.
+let caseName = fn(value: Any, expected: Str)
+	try Dyn.asStr(value)
+	catch Dyn.UnexpectedType(_): fail(expected, value)
+
+/// Decode one of a fixed set of strings into the value it stands for — the way
+/// a document writes what SCL holds as an enum. Anything that is not one of the
+/// strings the table names is rejected with all of them: `expected one of
+/// "dev", "prod"`.
+///
+/// ```scl
+/// type Env enum { .dev, .prod }
+///
+/// let env = Decode.choice(#{ "dev": .dev, "prod": .prod } as #{Str: Env})
+///
+/// env(Encoding.fromJson("\"prod\""))   // .prod
+/// ```
+///
+/// It is `choice` rather than `enum` because `enum` is a keyword.
+export let choice = fn<T>(cases: #{Str: T})
+	fn(value: Any)
+		let expected = casesOf(cases);
+		let name = caseName(value, expected);
+		if (Dict.has(cases, name)) Option.unwrap(cases[name]) else fail(expected, value)
+
 let identifierStart = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
 
 let identifierRest = identifierStart + "0123456789"
@@ -373,6 +581,8 @@ let formatSegment = fn(segment: Segment)
 				"[{quoted(name)}]"
 		case .index(index): "[{index}]"
 
+let relativePath = fn(path: [Segment]) Str.join([for (segment in path) formatSegment(segment)], "")
+
 /// Write a path the way a reader would index into the document: `$` on its own
 /// for the whole value, `.name` for a key that reads as an identifier,
 /// `["a key"]` for one that does not, and `[0]` for a position in a list.
@@ -381,8 +591,7 @@ let formatSegment = fn(segment: Segment)
 /// Decode.formatPath([.field("servers"), .index(0), .field("port")])
 /// // "$.servers[0].port"
 /// ```
-export let formatPath = fn(path: [Segment])
-	"$" + Str.join([for (segment in path) formatSegment(segment)], "")
+export let formatPath = fn(path: [Segment]) "$" + relativePath(path)
 
 let formatFields = fn(path: [Segment], expected: Str, actual: Str)
 	"at {formatPath(path)}: expected {expected}, got {actual}"
@@ -736,6 +945,327 @@ Test.group(
 		),
 )
 
+// A record whose second field the document is allowed to leave out.
+@test
+let listener = record(
+	fn(field: Field) { name: field("name", str), tls: field("tls", optional(bool)) },
+)
+
+@test
+Test.group(
+	"optional",
+	fn()
+		Test.it(
+			"reads nil as nil",
+			fn() Test.expect(optional(bool)(Encoding.fromJson("null")) == nil).toEqual(true),
+		);
+		Test.it(
+			"reads anything else with the decoder it was given",
+			fn() Test.expect(optional(bool)(Encoding.fromJson("true"))).toEqual(true as Bool?),
+		);
+		Test.it(
+			"refuses a value of the wrong type",
+			fn()
+				Test.expect(failureOf(optional(bool), Encoding.fromJson("\"yes\""))).toEqual(
+					atRoot("Bool", "\"yes\""),
+				),
+		);
+		Test.it(
+			"reads a field the document leaves out",
+			fn()
+				Test.expect(listener(Encoding.fromJson("\{\"name\": \"web\"}")).tls == nil).toEqual(
+					true,
+				),
+		);
+		Test.it(
+			"names the field of a value it refuses",
+			fn()
+				let json = "\{\"name\": \"web\", \"tls\": \"yes\"}";
+				let error = failureOf(listener, Encoding.fromJson(json));
+				Test.expect(error).toEqual(atPath([.field("tls")], "Bool", "\"yes\""));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.tls: expected Bool, got \"yes\""),
+		);
+		Test.it(
+			"applies anywhere a decoder does",
+			fn()
+				Test.expect(list(optional(int))(Encoding.fromJson("[1, null]"))).toEqual([
+					1 as Int?,
+					nil,
+				]),
+		),
+)
+
+@test
+Test.group(
+	"withDefault",
+	fn()
+		Test.it(
+			"stands the fallback in for nil",
+			fn() Test.expect(withDefault(bool, false)(Encoding.fromJson("null"))).toEqual(false),
+		);
+		Test.it(
+			"reads anything else with the decoder it was given",
+			fn() Test.expect(withDefault(bool, false)(Encoding.fromJson("true"))).toEqual(true),
+		);
+		Test.it(
+			"refuses a value of the wrong type rather than standing in for it",
+			fn()
+				let decoder = record(fn(field: Field) field("tls", withDefault(bool, false)));
+				let error = failureOf(decoder, Encoding.fromJson("\{\"tls\": \"yes\"}"));
+				Test.expect(error).toEqual(atPath([.field("tls")], "Bool", "\"yes\""));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.tls: expected Bool, got \"yes\""),
+		),
+)
+
+@test
+Test.group(
+	"map",
+	fn()
+		Test.it(
+			"puts what was decoded through the function",
+			fn() Test.expect(map(str, Str.toUpper)(Encoding.fromJson("\"web\""))).toEqual("WEB"),
+		);
+		Test.it(
+			"leaves a failure of the decoder it wraps where it was",
+			fn()
+				let decoder = record(fn(field: Field) field("name", map(str, Str.toUpper)));
+				let error = failureOf(decoder, Encoding.fromJson("\{\"name\": 1}"));
+				Test.expect(error).toEqual(atPath([.field("name")], "Str", "1"));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.name: expected Str, got 1"),
+		),
+)
+
+// A value written in one of two shapes, with a field of its own saying which.
+@test type Endpoint enum { .http(Int), .unix(Str) }
+
+// The shape read from the shape's own name, which is what `andThen` is for. The
+// chosen decoder reads the whole value again, so it sees the fields beside the
+// one that named it.
+@test
+let endpoint = andThen(
+	record(fn(field: Field) field("kind", str)),
+	fn(name: Str)
+		if (name == "http")
+			map(record(fn(field: Field) field("port", int)), fn(port: Int) .http(port) as Endpoint)
+		else if (name == "unix")
+			map(record(fn(field: Field) field("path", str)), fn(path: Str) .unix(path) as Endpoint)
+		else
+			fn(value: Any) fail("kind \"http\" or \"unix\"", value),
+)
+
+@test
+Test.group(
+	"andThen",
+	fn()
+		Test.it(
+			"reads the shape the value named",
+			fn()
+				let json = "\{\"kind\": \"http\", \"port\": 8080}";
+				Test.expect(endpoint(Encoding.fromJson(json))).toEqual(.http(8080) as Endpoint),
+		);
+		Test.it(
+			"reads the other shape the same way",
+			fn()
+				let json = "\{\"kind\": \"unix\", \"path\": \"/run/web.sock\"}";
+				Test.expect(endpoint(Encoding.fromJson(json))).toEqual(
+					.unix("/run/web.sock") as Endpoint,
+				),
+		);
+		Test.it(
+			"keeps the path of a failure the chosen decoder raised",
+			fn()
+				let json = "\{\"kind\": \"http\", \"port\": \"80\"}";
+				let error = failureOf(endpoint, Encoding.fromJson(json));
+				Test.expect(error).toEqual(atPath([.field("port")], "Int", "\"80\""));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.port: expected Int, got \"80\""),
+		);
+		Test.it(
+			"keeps that path under the one it was reached by",
+			fn()
+				let json = "[\{\"kind\": \"http\", \"port\": \"80\"}]";
+				let error = failureOf(list(endpoint), Encoding.fromJson(json));
+				Test.expect(error).toEqual(atPath([.index(0), .field("port")], "Int", "\"80\""));
+				Test.expect(error.message).toEqual("at $[0].port: expected Int, got \"80\""),
+		);
+		Test.it(
+			"refuses a value whose first decoder refuses it",
+			fn()
+				Test.expect(failureOf(endpoint, Encoding.fromJson("\{}"))).toEqual(
+					atPath([.field("kind")], "Str", "nil"),
+				),
+		);
+		Test.it(
+			"refuses a name no shape answers to",
+			fn()
+				let json = "\{\"kind\": \"grpc\"}";
+				let error = failureOf(endpoint, Encoding.fromJson(json));
+				Test.expect(error).toEqual(
+					atRoot("kind \"http\" or \"unix\"", "#\{\"kind\": \"grpc\"}"),
+				);
+				Test.expect(error.message).toEqual(formatError(error)),
+		),
+)
+
+// A whole number held to the range a port is written in.
+@test let port = refine(int, fn(n: Int) n >= 1 && n <= 65535, "port in 1..65535")
+
+@test
+Test.group(
+	"refine",
+	fn()
+		Test.it(
+			"gives back a value the condition holds for",
+			fn() Test.expect(port(Encoding.fromJson("8080"))).toEqual(8080),
+		);
+		Test.it(
+			"refuses one it does not hold for",
+			fn()
+				let error = failureOf(port, Encoding.fromJson("70000"));
+				Test.expect(error).toEqual(atRoot("port in 1..65535", "70000"));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $: expected port in 1..65535, got 70000"),
+		);
+		Test.it(
+			"leaves the decoder it wraps to refuse what it will",
+			fn()
+				Test.expect(failureOf(port, Encoding.fromJson("\"80\""))).toEqual(
+					atRoot("Int", "\"80\""),
+				),
+		);
+		Test.it(
+			"reports the value it decoded rather than the one it read",
+			fn()
+				let shouted = refine(
+					map(str, Str.toUpper),
+					fn(name: Str) name == "WEB",
+					"the name WEB",
+				);
+				Test.expect(failureOf(shouted, Encoding.fromJson("\"api\""))).toEqual(
+					atRoot("the name WEB", "\"API\""),
+				),
+		);
+		Test.it(
+			"names the field of a value it refuses",
+			fn()
+				let decoder = record(fn(field: Field) field("port", port));
+				let error = failureOf(decoder, Encoding.fromJson("\{\"port\": 70000}"));
+				Test.expect(error).toEqual(atPath([.field("port")], "port in 1..65535", "70000"));
+				Test.expect(error.message).toEqual(
+					"at $.port: expected port in 1..65535, got 70000",
+				),
+		),
+)
+
+// An address written either as a whole string or as a record naming a port on
+// the local machine, so a value that is neither is refused by both.
+@test
+let address = oneOf([
+	str,
+	map(record(fn(field: Field) field("port", int)), fn(port: Int) "localhost:{port}"),
+])
+
+@test
+Test.group(
+	"oneOf",
+	fn()
+		Test.it(
+			"takes the first alternative that accepts the value",
+			fn() Test.expect(address(Encoding.fromJson("\"web:80\""))).toEqual("web:80"),
+		);
+		Test.it(
+			"falls through to a later one",
+			fn()
+				Test.expect(address(Encoding.fromJson("\{\"port\": 8080}"))).toEqual(
+					"localhost:8080",
+				),
+		);
+		Test.it(
+			"names what every alternative wanted when none of them accepted it",
+			fn()
+				let decoder = record(fn(field: Field) field("address", address));
+				let json = "\{\"address\": \{\"port\": \"80\"}}";
+				let error = failureOf(decoder, Encoding.fromJson(json));
+				Test.expect(error).toEqual(
+					atPath(
+						[.field("address")],
+						"one of [Str, Int at .port]",
+						"#\{\"port\": \"80\"}",
+					),
+				);
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual(
+					"at $.address: expected one of [Str, Int at .port], got #\{\"port\": \"80\"}",
+				),
+		);
+		Test.it(
+			"accepts nothing when it was given no alternatives",
+			fn()
+				let error = failureOf(oneOf([] as [Decoder<Str>]), Encoding.fromJson("1"));
+				Test.expect(error).toEqual(atRoot("one of [] (no alternatives were given)", "1"));
+				Test.expect(error.message).toEqual(
+					"at $: expected one of [] (no alternatives were given), got 1",
+				),
+		),
+)
+
+// The environments a deployment is written for, and the strings a document
+// writes them as. The table is deliberately out of order, to show that the
+// failure lists them in one of their own.
+@test type Env enum { .dev, .prod, .staging }
+
+@test let env = choice(#{ "prod": .prod, "dev": .dev, "staging": .staging } as #{Str: Env})
+
+@test
+Test.group(
+	"choice",
+	fn()
+		Test.it(
+			"reads the value a string stands for",
+			fn() Test.expect(env(Encoding.fromJson("\"prod\""))).toEqual(.prod as Env),
+		);
+		Test.it(
+			"refuses a string that stands for nothing, listing the ones that do",
+			fn()
+				let error = failureOf(env, Encoding.fromJson("\"qa\""));
+				Test.expect(error).toEqual(
+					atRoot("one of \"dev\", \"prod\", \"staging\"", "\"qa\""),
+				);
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual(
+					"at $: expected one of \"dev\", \"prod\", \"staging\", got \"qa\"",
+				),
+		);
+		Test.it(
+			"refuses a value that is not a string at all",
+			fn()
+				Test.expect(failureOf(env, Encoding.fromJson("1"))).toEqual(
+					atRoot("one of \"dev\", \"prod\", \"staging\"", "1"),
+				),
+		);
+		Test.it(
+			"names the field of a value it refuses",
+			fn()
+				let decoder = record(fn(field: Field) field("env", env));
+				let error = failureOf(decoder, Encoding.fromJson("\{\"env\": \"qa\"}"));
+				Test.expect(error.path).toEqual([.field("env")]);
+				Test.expect(error.message).toEqual(
+					"at $.env: expected one of \"dev\", \"prod\", \"staging\", got \"qa\"",
+				),
+		);
+		Test.it(
+			"accepts nothing when it was given no cases",
+			fn()
+				let empty = choice(Dict.remove(#{ "dev": .dev } as #{Str: Env}, "dev"));
+				Test.expect(failureOf(empty, Encoding.fromJson("\"dev\""))).toEqual(
+					atRoot("one of nothing (no cases were given)", "\"dev\""),
+				),
+		),
+)
+
 @test
 Test.group(
 	"fail",
@@ -924,6 +1454,60 @@ Test.group(
 			fn()
 				Test.expect(formatError(atRoot("Str", "8080"))).toEqual(
 					"at $: expected Str, got 8080",
+				),
+		),
+)
+
+// A document of the shape a deployment is configured by, and the schema that
+// reads it: the worked example this package is introduced with, which has to go
+// on reading what it says it reads.
+@test type Service { name: Str, port: Int, replicas: Int? }
+
+@test type Deployment { region: Str, services: [Service] }
+
+@test
+let service = record(
+	fn(field: Field)
+		{
+			name: field("name", str),
+			port: field("port", int),
+			replicas: field("replicas", optional(int)),
+		} as Service,
+)
+
+@test
+let deployment = record(
+	fn(field: Field)
+		{ region: field("region", str), services: field("services", list(service)) } as Deployment,
+)
+
+@test let web = "\{\"name\": \"web\", \"port\": 8080, \"replicas\": 3}"
+
+@test let api = "\{\"name\": \"api\", \"port\": 9000}"
+
+@test let document = "\{\"region\": \"eu-north-1\", \"services\": [{web}, {api}]}"
+
+@test
+Test.group(
+	"a document read by a schema built out of several combinators",
+	fn()
+		Test.it(
+			"comes out at the type the schema names",
+			fn()
+				let decoded = deployment(Encoding.fromJson(document));
+				Test.expect(decoded.region).toEqual("eu-north-1");
+				Test.expect(List.map(decoded.services, fn(s) s.name)).toEqual(["web", "api"]);
+				Test.expect(List.map(decoded.services, fn(s) s.port)).toEqual([8080, 9000]);
+				Test.expect(List.map(decoded.services, fn(s) s.replicas)).toEqual([3 as Int?, nil]),
+		);
+		Test.it(
+			"stops at the first value that does not fit, and says where it is",
+			fn()
+				let broken = Str.replace(document, "\"port\": 9000", "\"port\": \"9000\"");
+				let error = failureOf(deployment, Encoding.fromJson(broken));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual(
+					"at $.services[1].port: expected Int, got \"9000\"",
 				),
 		),
 )
