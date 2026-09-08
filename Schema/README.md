@@ -8,7 +8,7 @@ path into the document, what was expected there, and what was found.
 
 ## Reading a document
 
-Given a `services.json` of
+Given a document of
 
 ```json
 {
@@ -26,6 +26,10 @@ out of the schema rather than being asserted onto it:
 ```scl
 import Constructs/Schema/Decode
 import Std/Encoding
+
+let document = "\{\"region\": \"eu-north-1\", \"services\": ["
+	+ "\{\"name\": \"web\", \"port\": 8080, \"replicas\": 3}, "
+	+ "\{\"name\": \"api\", \"port\": 9000}]}"
 
 type Service { name: Str, port: Int, replicas: Int? }
 
@@ -45,10 +49,11 @@ let deployment = Decode.record(fn(field: Decode.Field) {
 let decoded = deployment(Encoding.fromJson(document))
 ```
 
-`decoded.services` is a `[Service]`, `decoded.services[0].port` is the `Int`
-`8080` — JSON has one number type, so the document's `8080` arrives as a float
-and is read back as the whole number it is — and the second service's
-`replicas` is `nil`, because the document leaves it out.
+`decoded` is a `Deployment` and `decoded.services` a `[Service]`. The first
+service's `port` is the `Int` `8080` — JSON has one number type, so the
+document's `8080` arrives as a float and is read back as the whole number it is
+— and the second service's `replicas` is `nil`, because the document leaves it
+out.
 
 Writing `"port": "9000"` instead of `"port": 9000` in that second service stops
 the decode with the path down to it:
