@@ -758,13 +758,13 @@ Test.group(
 			"reads every value under the key it was under",
 			fn()
 				let value = dict(int)(Encoding.fromJson("\{\"web\": 80, \"api\": 443}"));
-				Test.expect(Dict.size(value)).toEqual(2);
+				Test.expect(Dict.length(value)).toEqual(2);
 				Test.expect(value["web"]).toEqual(80 as Int?);
 				Test.expect(value["api"]).toEqual(443 as Int?),
 		);
 		Test.it(
 			"reads a table with nothing in it",
-			fn() Test.expect(Dict.size(dict(str)(Encoding.fromJson("\{}")))).toEqual(0),
+			fn() Test.expect(Dict.length(dict(str)(Encoding.fromJson("\{}")))).toEqual(0),
 		);
 		Test.it(
 			"refuses a value that is not a dict",
