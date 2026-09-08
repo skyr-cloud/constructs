@@ -1,0 +1,513 @@
+//! Turn a dynamic value into a statically typed one. The `Any` values that
+//! `Std/Encoding`'s parsers hand back carry no types SCL can check, and
+//! `Std/Dyn`'s casts recover one type at a time without saying where in the
+//! document a mismatch was found. A decoder is an ordinary `fn(Any) T`, so
+//! decoders nest to the shape of the value they read, and a value that does not
+//! fit raises [`DecodeError`](#decodeerror) naming the path into the document,
+//! what was expected there, and what was found.
+//!
+//! ```scl
+//! import Constructs/Schema/Decode
+//! import Std/Encoding
+//!
+//! Decode.int(Encoding.fromJson("8080"))   // 8080
+//! ```
+//!
+//! A decoder that rejects a value raises rather than returning a result, which
+//! is what deployment code wants by default: a configuration that does not fit
+//! should stop the deployment, loudly. Recovering is `try`/`catch`:
+//!
+//! ```scl
+//! try
+//! 	Decode.int(value)
+//! catch Decode.DecodeError(e):
+//! 	Decode.formatError(e)
+//! ```
+
+import Std/Dyn
+import Std/Float
+import Std/List
+import Std/Num
+import Std/Str
+@test import Std/Encoding
+@test import Std/Test
+
+/// A schema for a `T`: a function that reads one dynamic value and either
+/// produces a `T` or raises [`DecodeError`](#decodeerror). Every combinator in
+/// this module builds one, and any `fn(Any) T` is one already — including
+/// `Std/Dyn`'s own `as*` casts.
+export type Decoder<T> fn(Any) T
+
+/// One step of the way from the root of a decoded value to the place a failure
+/// is about: a key of a dict, or a zero-based position in a list.
+export type Segment enum { .field(Str), .index(Int) }
+
+/// Everything a rejected value is rejected for.
+export type Error {
+	/// The way from the root of the value the outermost decoder was applied to
+	/// down to the offending one. Empty when the root itself is the offender.
+	path: [Segment],
+	/// A short phrase naming the type or the constraint that was required, such
+	/// as `Int` or `port in 1..65535`.
+	expected: Str,
+	/// The offending value, rendered, and shortened when it is large.
+	actual: Str,
+}
+
+/// Raised by every decoder that rejects a value, carrying an
+/// [`Error`](#type-error) that says which value and why.
+///
+/// ```scl
+/// try
+/// 	Decode.str(value)
+/// catch Decode.DecodeError(e):
+/// 	e.expected   // "Str"
+/// ```
+export let DecodeError = exception(Error)
+
+/// How long a rendered value may run before it is cut short: long enough to
+/// recognise the value that was found, short enough that a large document does
+/// not bury the message it belongs to.
+let renderLimit = 80
+
+let ellipsis = "…"
+
+let truncate = fn(text: Str)
+	if (Str.length(text) > renderLimit)
+		Str.slice(text, 0, renderLimit - 1) + ellipsis
+	else
+		text
+
+let quoted = fn(text: Str) "\"{text}\""
+
+/// Write a dynamic value the way an error message should show it: a string
+/// quoted, so an empty or space-padded one is still visible, and everything
+/// else — scalars, lists, dicts — the way SCL itself writes it.
+///
+/// Only the one cast that changes the rendering is attempted. The type a value
+/// actually holds is legible no other way: `Std/Dyn` names it in the message of
+/// the exception it raises, and a message is prose, not something to read back.
+let renderExactly = fn(value: Any)
+	if (value == nil)
+		"nil"
+	else
+		try quoted(Dyn.asStr(value))
+		catch Dyn.UnexpectedType(_): "{value}"
+
+let render = fn(value: Any) truncate(renderExactly(value))
+
+/// The error a value gets when it is rejected where it stands, before any
+/// combinator has had the chance to say where that is.
+let rootError = fn(expected: Str, value: Any)
+	{ path: [] as [Segment], expected, actual: render(value) } as Error
+
+/// Reject `value`, saying what was expected in its place.
+///
+/// The path starts empty and is filled in from the outside: each combinator the
+/// failing decoder is nested inside adds its own segment as the exception
+/// travels out. A hand-written decoder calls this to fail exactly the way the
+/// ones in this module do.
+///
+/// ```scl
+/// let port = fn(value: Any)
+/// 	let n = Decode.int(value);
+/// 	if (n >= 1 && n <= 65535) n else Decode.fail("port in 1..65535", value)
+/// ```
+export let fail = fn(expected: Str, value: Any) raise DecodeError(rootError(expected, value))
+
+/// What a bare `Std/Dyn` cast is reported to have wanted when it refuses a
+/// value. The cast knows which type it was after, but says so only in the prose
+/// of its exception, so a decoder built out of this module's own combinators —
+/// each of which names the type it wanted — always reads better than one built
+/// out of `Dyn.as*` directly.
+let castMismatch = "a different type"
+
+/// The error `error` turns into once it is known to be about the child at
+/// `segment` rather than about a value of its own.
+let errorAt = fn(segment: Segment, error: Error)
+	{ path: [segment, in error.path], expected: error.expected, actual: error.actual } as Error
+
+/// Decode the child at `segment` of the value being decoded, so a failure
+/// underneath reports the whole path rather than the part of it the child could
+/// see. Every combinator that descends into a value goes through here.
+///
+/// A `Std/Dyn` cast used as a decoder raises `UnexpectedType`, which carries no
+/// path at all; it becomes a `DecodeError` here, so a bare `Dyn.as*` composes
+/// like anything else.
+let at = fn<T>(segment: Segment, value: Any, decode: Decoder<T>)
+	try decode(value)
+	catch DecodeError(e): raise DecodeError(errorAt(segment, e))
+	catch Dyn.UnexpectedType(_): raise DecodeError(errorAt(segment, rootError(castMismatch, value)))
+
+/// A decoder that hands the value to one `Std/Dyn` cast and reports `expected`
+/// when the cast refuses it.
+let casting = fn<T>(expected: Str, cast: fn(Any) T)
+	fn(value: Any)
+		try cast(value)
+		catch Dyn.UnexpectedType(_): fail(expected, value)
+
+/// Decode a string. Nothing is coerced: a number stays a mismatch, and a
+/// document that writes a port as `"8080"` is a document to fix.
+///
+/// ```scl
+/// Decode.str(Encoding.fromJson("\"main\""))   // "main"
+/// ```
+export let str: Decoder<Str> = casting("Str", Dyn.asStr)
+
+/// Decode a boolean.
+export let bool: Decoder<Bool> = casting("Bool", Dyn.asBool)
+
+/// The magnitude at which a `Float` stops fitting in an `Int`.
+let intLimit = Num.toFloat(9000000000000000000)
+
+/// The `Int` a `Float` stands for, or a mismatch when it stands for none.
+/// Rounding a float larger than an `Int` can hold overflows, which would end
+/// the evaluation outright, so magnitude is checked before the fraction is.
+let wholeFloat = fn(value: Any)
+	let number = Dyn.asFloat(value);
+	if (Float.abs(number) < intLimit && Num.toFloat(Float.round(number)) == number)
+		Float.round(number)
+	else
+		fail("Int", value)
+
+/// Decode a whole number.
+///
+/// An `Int` — what YAML and TOML produce — passes through. A `Float` that holds
+/// a whole number is one too: JSON has a single number type, so a document's
+/// `8080` arrives as a float and is still a port. A number with a fraction is a
+/// mismatch, not a rounding.
+///
+/// ```scl
+/// Decode.int(Encoding.fromJson("8080"))   // 8080
+/// ```
+export let int: Decoder<Int> = fn(value)
+	try Dyn.asInt(value)
+	catch Dyn.UnexpectedType(_): try wholeFloat(value)
+	catch Dyn.UnexpectedType(_): fail("Int", value)
+
+/// Decode a number, keeping its fraction. An `Int` widens: a document that
+/// writes `1` where a fraction is allowed means `1.0`.
+///
+/// ```scl
+/// Decode.float(Encoding.fromJson("0.25"))   // 0.25
+/// ```
+export let float: Decoder<Float> = fn(value)
+	try Dyn.asFloat(value)
+	catch Dyn.UnexpectedType(_): try Num.toFloat(Dyn.asInt(value))
+	catch Dyn.UnexpectedType(_): fail("Float", value)
+
+/// Keep the value dynamic. Accepts anything, including `nil`, and never fails —
+/// for the corner of a document whose shape is the consumer's business rather
+/// than the schema's.
+export let any: Decoder<Any> = fn(value) value
+
+let identifierStart = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
+
+let identifierRest = identifierStart + "0123456789"
+
+/// Whether a key can be written as `.name` in a path instead of being quoted.
+let isIdentifier = fn(name: Str)
+	let length = Str.length(name);
+	length > 0 && Str.contains(identifierStart, Str.slice(name, 0, 1)) && List.all(
+		List.range(length),
+		fn(i: Int) Str.contains(identifierRest, Str.slice(name, i, i + 1)),
+	)
+
+let formatSegment = fn(segment: Segment)
+	switch segment
+		case .field(name):
+			if (isIdentifier(name))
+				".{name}"
+			else
+				"[\"{name}\"]"
+		case .index(index): "[{index}]"
+
+/// Write a path the way a reader would index into the document: `$` on its own
+/// for the whole value, `.name` for a key that reads as an identifier,
+/// `["a key"]` for one that does not, and `[0]` for a position in a list.
+///
+/// ```scl
+/// Decode.formatPath([.field("servers"), .index(0), .field("port")])
+/// // "$.servers[0].port"
+/// ```
+export let formatPath = fn(path: [Segment])
+	"$" + Str.join([for (segment in path) formatSegment(segment)], "")
+
+/// Write an error as one sentence, `at <path>: expected <expected>, got
+/// <actual>`, ready to be raised, logged, or joined with others.
+///
+/// ```scl
+/// Decode.formatError({ path: [.field("port")], expected: "Int", actual: "\"80\"" })
+/// // "at $.port: expected Int, got \"80\""
+/// ```
+export let formatError = fn(error: Error)
+	"at {formatPath(error.path)}: expected {error.expected}, got {error.actual}"
+
+@test
+let failureOf = fn<T>(decode: Decoder<T>, value: Any)
+	try {
+		path: [] as [Segment],
+		expected: "a rejected value",
+		actual: render(decode(value) as Any),
+	} as Error
+	catch DecodeError(e): e
+
+// The `Error` a decoder raised for a value, so a case can assert on the whole
+// payload at once. A decoder that accepts the value instead reports that, as an
+// error no decoder would raise.
+@test
+let atRoot = fn(expected: Str, actual: Str)
+	{ path: [] as [Segment], expected, actual } as Error
+
+// The `Error` a decoder raises for a value that fails where it stands.
+@test
+Test.group(
+	"str",
+	fn()
+		Test.it(
+			"reads a string",
+			fn() Test.expect(str(Encoding.fromJson("\"main\""))).toEqual("main"),
+		);
+		Test.it(
+			"refuses a number",
+			fn()
+				Test.expect(failureOf(str, Encoding.fromJson("8080"))).toEqual(
+					atRoot("Str", "8080"),
+				),
+		);
+		Test.it(
+			"refuses nil",
+			fn()
+				Test.expect(failureOf(str, Encoding.fromJson("null"))).toEqual(atRoot("Str", "nil")),
+		),
+)
+
+@test
+Test.group(
+	"bool",
+	fn()
+		Test.it("reads a boolean", fn() Test.expect(bool(Encoding.fromJson("true"))).toEqual(true));
+		Test.it(
+			"refuses a string",
+			fn()
+				Test.expect(failureOf(bool, Encoding.fromJson("\"yes\""))).toEqual(
+					atRoot("Bool", "\"yes\""),
+				),
+		),
+)
+
+@test
+Test.group(
+	"int",
+	fn()
+		Test.it("reads an integer", fn() Test.expect(int(7 as Any)).toEqual(7));
+		Test.it(
+			"reads a whole number written as a float",
+			fn() Test.expect(int(Encoding.fromJson("8080"))).toEqual(8080),
+		);
+		Test.it(
+			"refuses a fraction",
+			fn()
+				Test.expect(failureOf(int, Encoding.fromJson("1.5"))).toEqual(atRoot("Int", "1.5")),
+		);
+		Test.it(
+			"refuses a string",
+			fn()
+				Test.expect(failureOf(int, Encoding.fromJson("\"eighty\""))).toEqual(
+					atRoot("Int", "\"eighty\""),
+				),
+		);
+		Test.it(
+			"reads a negative whole number written as a float",
+			fn() Test.expect(int(Encoding.fromJson("-1"))).toEqual(-1),
+		);
+		Test.it(
+			"refuses nil",
+			fn()
+				Test.expect(failureOf(int, Encoding.fromJson("null"))).toEqual(atRoot("Int", "nil")),
+		);
+		Test.it(
+			"refuses a number too large to hold rather than overflowing",
+			fn()
+				let error = failureOf(int, Encoding.fromJson("1e300"));
+				Test.expect(error.expected).toEqual("Int");
+				Test.expect(Str.startsWith(error.actual, "1000000")).toEqual(true),
+		),
+)
+
+@test
+Test.group(
+	"float",
+	fn()
+		Test.it(
+			"reads a fraction",
+			fn() Test.expect(float(Encoding.fromJson("0.25"))).toEqual(0.25),
+		);
+		Test.it("widens an integer", fn() Test.expect(float(2 as Any)).toEqual(Num.toFloat(2)));
+		Test.it(
+			"refuses a string",
+			fn()
+				Test.expect(failureOf(float, Encoding.fromJson("\"0.25\""))).toEqual(
+					atRoot("Float", "\"0.25\""),
+				),
+		),
+)
+
+@test
+Test.group(
+	"any",
+	fn()
+		Test.it(
+			"keeps the value as it came",
+			fn() Test.expect(Dyn.asStr(any(Encoding.fromJson("\"main\"")))).toEqual("main"),
+		);
+		Test.it(
+			"accepts nil",
+			fn() Test.expect(any(Encoding.fromJson("null")) == nil).toEqual(true),
+		),
+)
+
+@test
+Test.group(
+	"fail",
+	fn()
+		Test.it(
+			"rejects a value at the root",
+			fn()
+				Test.expect(failureOf(fn(v: Any) fail("port in 1..65535", v), 70000 as Any)).toEqual(
+					atRoot("port in 1..65535", "70000"),
+				),
+		);
+		Test.it(
+			"renders nil",
+			fn()
+				Test.expect(failureOf(fn(v: Any) fail("Str", v), Encoding.fromJson("null"))).toEqual(
+					atRoot("Str", "nil"),
+				),
+		);
+		Test.it(
+			"renders a list the way SCL writes it",
+			fn()
+				Test.expect(failureOf(fn(v: Any) fail("Str", v), Encoding.fromJson("[1, \"two\"]"))).toEqual(
+					atRoot("Str", "[1, \"two\"]"),
+				),
+		);
+		Test.it(
+			"renders a dict the way SCL writes it",
+			fn()
+				Test.expect(failureOf(fn(v: Any) fail("Str", v), Encoding.fromJson("\{\"a\": 1}"))).toEqual(
+					atRoot("Str", "#\{\"a\": 1}"),
+				),
+		),
+)
+
+@test
+Test.group(
+	"rendering a large value",
+	fn()
+		Test.it(
+			"cuts it short",
+			fn()
+				let long = Str.repeat("x", 200);
+				let error = failureOf(int, long as Any);
+				Test.expect(Str.length(error.actual)).toEqual(80);
+				Test.expect(Str.endsWith(error.actual, "…")).toEqual(true),
+		);
+		Test.it(
+			"leaves a value that fits alone",
+			fn()
+				let short = Str.repeat("x", 78);
+				let error = failureOf(int, short as Any);
+				Test.expect(error.actual).toEqual("\"{short}\""),
+		),
+)
+
+@test
+Test.group(
+	"at",
+	fn()
+		Test.it(
+			"prefixes its segment onto a failure underneath",
+			fn()
+				Test.expect(
+					failureOf(fn(v: Any) at(.field("port"), v, int), Encoding.fromJson("\"80\"")),
+				).toEqual({ path: [.field("port")], expected: "Int", actual: "\"80\"" } as Error),
+		);
+		Test.it(
+			"builds the path from the inside out",
+			fn()
+				let inner = fn(v: Any) at(.field("port"), v, int);
+				Test.expect(
+					failureOf(fn(v: Any) at(.index(0), v, inner), Encoding.fromJson("\"80\"")),
+				).toEqual(
+					{
+						path: [.index(0), .field("port")],
+						expected: "Int",
+						actual: "\"80\"",
+					} as Error,
+				),
+		);
+		Test.it(
+			"turns a bare Std/Dyn cast into a decoder failure",
+			fn()
+				Test.expect(
+					failureOf(fn(v: Any) at(.index(2), v, Dyn.asStr), Encoding.fromJson("1")),
+				).toEqual({ path: [.index(2)], expected: castMismatch, actual: "1" } as Error),
+		),
+)
+
+@test
+Test.group(
+	"formatPath",
+	fn()
+		Test.it("writes the root as a dollar", fn() Test.expect(formatPath([])).toEqual("$"));
+		Test.it(
+			"writes an identifier key with a dot",
+			fn() Test.expect(formatPath([.field("port")])).toEqual("$.port"),
+		);
+		Test.it(
+			"quotes a key that is not an identifier",
+			fn() Test.expect(formatPath([.field("some key")])).toEqual("$[\"some key\"]"),
+		);
+		Test.it(
+			"quotes a key that starts with a digit",
+			fn() Test.expect(formatPath([.field("0th")])).toEqual("$[\"0th\"]"),
+		);
+		Test.it(
+			"quotes an empty key",
+			fn() Test.expect(formatPath([.field("")])).toEqual("$[\"\"]"),
+		);
+		Test.it(
+			"writes an index in brackets",
+			fn()
+				Test.expect(formatPath([.field("servers"), .index(0), .field("port")])).toEqual(
+					"$.servers[0].port",
+				),
+		),
+)
+
+@test
+Test.group(
+	"formatError",
+	fn()
+		Test.it(
+			"writes a failure as one sentence",
+			fn()
+				Test.expect(
+					formatError(
+						{
+							path: [.field("servers"), .index(0), .field("port")],
+							expected: "Int",
+							actual: "\"80\"",
+						} as Error,
+					),
+				).toEqual("at $.servers[0].port: expected Int, got \"80\""),
+		);
+		Test.it(
+			"writes a failure at the root",
+			fn()
+				Test.expect(formatError(atRoot("Str", "8080"))).toEqual(
+					"at $: expected Str, got 8080",
+				),
+		),
+)
