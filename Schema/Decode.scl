@@ -435,13 +435,16 @@ let refusalPhrase = fn(error: Error)
 	else
 		"{error.expected} at {relativePath(error.path)}"
 
-/// What one alternative produced, kept in a list of its own so that an
-/// alternative which produced `nil` still counts as one that produced
-/// something.
-let decodedBy = fn<T>(value: T) { decoded: [value], refusal: nil as Str? }
+/// What one alternative produced, held twice over: in a record, so that an
+/// alternative which produced `nil` is holding something rather than nothing,
+/// and in a list, so that one which produced nothing holds none. A bare `T?`
+/// would not do: an optional of an optional is the same one type, and a
+/// decoded `nil` would read as a refusal.
+let decodedBy = fn<T>(value: T) { decoded: [{ value }], refusal: nil as Str? }
 
 /// An alternative that produced nothing, and the phrase saying why.
-let refusedWith = fn<T>(phrase: Str) { decoded: [] as [T], refusal: phrase as Str? }
+let refusedWith = fn<T>(phrase: Str)
+	{ decoded: [] as [{ value: T }], refusal: phrase as Str? }
 
 /// What one alternative made of a value: what it decoded, or why it would not.
 let attemptOf = fn<T>(decode: Decoder<T>, value: Any)
@@ -455,14 +458,19 @@ let noAlternatives = "one of [] (no alternatives were given)"
 /// The phrase for a value every alternative refused: what each of them wanted,
 /// in the order they were written, bracketed so the list of them ends where the
 /// rest of the sentence begins.
-let refusedByAll = fn<T>(attempts: [{ decoded: [T], refusal: Str? }])
+let refusedByAll = fn<T>(attempts: [{ decoded: [{ value: T }], refusal: Str? }])
 	let refusals = List.flatMap(attempts, fn(attempt) Option.toList(attempt.refusal));
 	let listed = Str.join(refusals, ", ");
 	if (List.isEmpty(refusals)) noAlternatives else "one of [{listed}]"
 
 /// Decode a value that may be written in more than one way, all of them read as
-/// the same type. Every alternative is tried, and the first that accepts the
-/// value gives the result.
+/// the same type. The first alternative that accepts the value gives the
+/// result.
+///
+/// Every alternative is tried, including those after the one that accepted the
+/// value, so an exception a later alternative raises that is neither
+/// [`DecodeError`](#decodeerror) nor `Std/Dyn`'s `UnexpectedType` — the two a
+/// refusal is made of — is not passed over: it propagates.
 ///
 /// When none of them accepts it, the failure names what each of them wanted,
 /// and where it wanted it: `at $.address: expected one of [Str, Int at .port],
@@ -480,7 +488,7 @@ export let oneOf = fn<T>(alternatives: [Decoder<T>])
 		if (List.isEmpty(decoded))
 			fail(refusedByAll(attempts), value)
 		else
-			Option.unwrap(List.first(decoded))
+			Option.unwrap(List.first(decoded)).value
 
 /// The characters a case name is put in order by, in the order they are put in:
 /// printable ASCII, which is what the names of a set of cases are written in.
@@ -1209,6 +1217,29 @@ Test.group(
 				Test.expect(error.message).toEqual(
 					"at $: expected one of [] (no alternatives were given), got 1",
 				),
+		);
+		Test.it(
+			"gives back the nil an alternative decoded rather than reading it as a refusal",
+			fn()
+				Test.expect(oneOf([optional(int)])(Encoding.fromJson("null")) == nil).toEqual(true),
+		);
+		Test.it(
+			"gives back the nil an alternative that refuses nothing decoded",
+			fn() Test.expect(oneOf([any])(Encoding.fromJson("null")) == nil).toEqual(true),
+		);
+		Test.it(
+			"takes an alternative that decoded nil over the ones after it",
+			fn()
+				let decoder = oneOf([optional(str), map(int, Num.toStr)]);
+				Test.expect(decoder(Encoding.fromJson("null")) == nil).toEqual(true);
+				Test.expect(decoder(Encoding.fromJson("8080"))).toEqual("8080" as Str?),
+		);
+		Test.it(
+			"reads a field whose value is allowed to be absent",
+			fn()
+				let decoder = record(fn(field: Field) field("replicas", oneOf([optional(int)])));
+				Test.expect(decoder(Encoding.fromJson("\{}")) == nil).toEqual(true);
+				Test.expect(decoder(Encoding.fromJson("\{\"replicas\": 3}"))).toEqual(3 as Int?),
 		),
 )
 
