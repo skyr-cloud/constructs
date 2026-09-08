@@ -453,7 +453,7 @@ let attemptOf = fn<T>(decode: Decoder<T>, value: Any)
 	catch Dyn.UnexpectedType(message): refusedWith<T>(castMismatch(message))
 
 /// The phrase a value gets when it was offered to no alternative at all.
-let noAlternatives = "one of [] (no alternatives were given)"
+let noAlternatives = "one of no alternatives"
 
 /// The phrase for a value every alternative refused: what each of them wanted,
 /// in the order they were written, bracketed so the list of them ends where the
@@ -490,58 +490,15 @@ export let oneOf = fn<T>(alternatives: [Decoder<T>])
 		else
 			Option.unwrap(List.first(decoded)).value
 
-/// The characters a case name is put in order by, in the order they are put in:
-/// printable ASCII, which is what the names of a set of cases are written in.
-/// A character outside it ranks after all of them, and ties with every other
-/// such character, which leaves two names that differ only there in the order
-/// the table had them.
-let ordering = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz\{|}~"
-
-/// Where the character at `index` of `name` comes in that order, and before all
-/// of them when the name has ended.
-let rankIn = fn(name: Str, index: Int)
-	if (index >= Str.length(name))
-		-1
-	else
-		Option.default(
-			Str.indexOf(ordering, Str.slice(name, index, index + 1)),
-			Str.length(ordering),
-		)
-
-/// Whether `name` comes before `other`, compared from `index` onwards.
-let comesBefore = fn(name: Str, other: Str, index: Int)
-	if (index >= Str.length(name) && index >= Str.length(other))
-		false
-	else if (rankIn(name, index) == rankIn(other, index))
-		comesBefore(name, other, index + 1)
-	else
-		rankIn(name, index) < rankIn(other, index)
-
-/// `sorted` with `name` put where it belongs in it.
-let insertName = fn(sorted: [Str], name: Str)
-	[
-		in List.filter(sorted, fn(other: Str) comesBefore(other, name, 0)),
-		name,
-		in List.filter(sorted, fn(other: Str) !comesBefore(other, name, 0)),
-	]
-
-/// `rest` merged into `sorted`, one name at a time.
-let sortNames = fn(rest: [Str], sorted: [Str])
-	if (List.isEmpty(rest))
-		sorted
-	else
-		sortNames(List.skip(rest, 1), insertName(sorted, Option.unwrap(List.first(rest))))
-
 /// The phrase a value gets when it names no case of a table with no cases.
-let noCases = "one of nothing (no cases were given)"
+let noCases = "one of no cases"
 
-/// The phrase naming the strings a table accepts. They are put in order rather
-/// than listed as the table holds them, so that the same set of cases reads the
-/// same way however the table was built.
+/// The phrase naming the strings a table accepts, bracketed so the list of them
+/// ends where the rest of the sentence begins.
 let casesOf = fn<T>(cases: #{Str: T})
-	let names = [for (name in sortNames(Dict.keys(cases), [] as [Str])) quoted(name)];
+	let names = [for (name in Dict.keys(cases)) quoted(name)];
 	let listed = Str.join(names, ", ");
-	if (List.isEmpty(names)) noCases else "one of {listed}"
+	if (List.isEmpty(names)) noCases else "one of [{listed}]"
 
 /// The string a value stands for, or a mismatch naming the cases there are.
 let caseName = fn(value: Any, expected: Str)
@@ -551,7 +508,12 @@ let caseName = fn(value: Any, expected: Str)
 /// Decode one of a fixed set of strings into the value it stands for — the way
 /// a document writes what SCL holds as an enum. Anything that is not one of the
 /// strings the table names is rejected with all of them: `expected one of
-/// "dev", "prod"`.
+/// ["dev", "prod"]`.
+///
+/// They are listed in the order the table holds them, which for a table written
+/// out as a literal is the order it was written in, so the message reads the
+/// way the schema does. A table with no cases in it accepts nothing, and says
+/// so.
 ///
 /// ```scl
 /// type Env enum { .dev, .prod }
@@ -563,8 +525,8 @@ let caseName = fn(value: Any, expected: Str)
 ///
 /// It is `choice` rather than `enum` because `enum` is a keyword.
 export let choice = fn<T>(cases: #{Str: T})
+	let expected = casesOf(cases);
 	fn(value: Any)
-		let expected = casesOf(cases);
 		let name = caseName(value, expected);
 		if (Dict.has(cases, name)) Option.unwrap(cases[name]) else fail(expected, value)
 
@@ -1213,10 +1175,8 @@ Test.group(
 			"accepts nothing when it was given no alternatives",
 			fn()
 				let error = failureOf(oneOf([] as [Decoder<Str>]), Encoding.fromJson("1"));
-				Test.expect(error).toEqual(atRoot("one of [] (no alternatives were given)", "1"));
-				Test.expect(error.message).toEqual(
-					"at $: expected one of [] (no alternatives were given), got 1",
-				),
+				Test.expect(error).toEqual(atRoot("one of no alternatives", "1"));
+				Test.expect(error.message).toEqual("at $: expected one of no alternatives, got 1"),
 		);
 		Test.it(
 			"gives back the nil an alternative decoded rather than reading it as a refusal",
@@ -1244,8 +1204,8 @@ Test.group(
 )
 
 // The environments a deployment is written for, and the strings a document
-// writes them as. The table is deliberately out of order, to show that the
-// failure lists them in one of their own.
+// writes them as. The table is deliberately not in alphabetical order, to show
+// that the failure lists the names the way the table has them.
 @test type Env enum { .dev, .prod, .staging }
 
 @test let env = choice(#{ "prod": .prod, "dev": .dev, "staging": .staging } as #{Str: Env})
@@ -1259,22 +1219,22 @@ Test.group(
 			fn() Test.expect(env(Encoding.fromJson("\"prod\""))).toEqual(.prod as Env),
 		);
 		Test.it(
-			"refuses a string that stands for nothing, listing the ones that do",
+			"refuses a string that stands for nothing, listing the ones that do in the table's order",
 			fn()
 				let error = failureOf(env, Encoding.fromJson("\"qa\""));
 				Test.expect(error).toEqual(
-					atRoot("one of \"dev\", \"prod\", \"staging\"", "\"qa\""),
+					atRoot("one of [\"prod\", \"dev\", \"staging\"]", "\"qa\""),
 				);
 				Test.expect(error.message).toEqual(formatError(error));
 				Test.expect(error.message).toEqual(
-					"at $: expected one of \"dev\", \"prod\", \"staging\", got \"qa\"",
+					"at $: expected one of [\"prod\", \"dev\", \"staging\"], got \"qa\"",
 				),
 		);
 		Test.it(
 			"refuses a value that is not a string at all",
 			fn()
 				Test.expect(failureOf(env, Encoding.fromJson("1"))).toEqual(
-					atRoot("one of \"dev\", \"prod\", \"staging\"", "1"),
+					atRoot("one of [\"prod\", \"dev\", \"staging\"]", "1"),
 				),
 		);
 		Test.it(
@@ -1284,7 +1244,7 @@ Test.group(
 				let error = failureOf(decoder, Encoding.fromJson("\{\"env\": \"qa\"}"));
 				Test.expect(error.path).toEqual([.field("env")]);
 				Test.expect(error.message).toEqual(
-					"at $.env: expected one of \"dev\", \"prod\", \"staging\", got \"qa\"",
+					"at $.env: expected one of [\"prod\", \"dev\", \"staging\"], got \"qa\"",
 				),
 		);
 		Test.it(
@@ -1292,7 +1252,7 @@ Test.group(
 			fn()
 				let empty = choice(Dict.remove(#{ "dev": .dev } as #{Str: Env}, "dev"));
 				Test.expect(failureOf(empty, Encoding.fromJson("\"dev\""))).toEqual(
-					atRoot("one of nothing (no cases were given)", "\"dev\""),
+					atRoot("one of no cases", "\"dev\""),
 				),
 		),
 )
