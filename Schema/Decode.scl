@@ -285,9 +285,12 @@ let entryOf = fn<T>(entry: { key: Any, value: Any }, item: Decoder<T>)
 /// have different types, use [`record`](#record).
 ///
 /// ```scl
-/// Decode.dict(Decode.int)(Encoding.fromJson("\{\"web\": 80, \"api\": 443}"))
-/// // #{"web": 80, "api": 443}
+/// Decode.dict(Decode.int)(Encoding.fromJson("\{\"web\": 80}"))
+/// // #{"web": 80}
 /// ```
+///
+/// Entries keep the order the value being decoded had them in, which for a
+/// parsed document is the parser's order rather than the document's.
 export let dict = fn<T>(item: Decoder<T>)
 	fn(value: Any)
 		Dict.fromList([for (e in Dict.entries(asEntries(value))) entryOf(e, item)])
@@ -297,8 +300,9 @@ export let dict = fn<T>(item: Decoder<T>)
 /// record can each have a different type.
 ///
 /// A builder closure must annotate its parameter with this type — `fn(field:
-/// Decode.Field)` — or the checker fixes the field function at a single type and
-/// the record does not compile.
+/// Decode.Field)`. Left unannotated, the checker fixes the field function at one
+/// type for the whole record, which is `Never`, and every field is refused with
+/// `invalid type: Str is not assignable to Never`.
 export type Field fn<U>(Str, Decoder<U>) U
 
 /// Decode a record by naming its fields. The builder is handed a `field`
@@ -320,6 +324,24 @@ export type Field fn<U>(Str, Decoder<U>) U
 /// does, and the field's decoder rejects it — `at $.port: expected Int, got
 /// nil`. A field that is allowed to be missing or null says so in its decoder,
 /// which is where every other condition on a field is written too.
+///
+/// The builder's parameter has to be annotated [`Decode.Field`](#type-field);
+/// without the annotation every field is refused with `invalid type: Str is not
+/// assignable to Never`.
+///
+/// A shape that contains itself is decoded by ordinary recursion, but the
+/// decoder has to be written as a function of the value — a binding that is just
+/// the decoder this returns is refused with `recursive bindings must be
+/// functions` — and the record literal has to be ascribed to the named type, or
+/// the errors are about `Any` and `Never` instead:
+///
+/// ```scl
+/// let tree = fn(value: Any)
+/// 	Decode.record(fn(field: Decode.Field) {
+/// 		value: field("value", Decode.int),
+/// 		children: field("children", Decode.list(tree)),
+/// 	} as Tree)(value)
+/// ```
 export let record = fn<T>(build: fn(Field) T)
 	fn(value: Any)
 		let fields = asFields(value);
