@@ -24,6 +24,7 @@
 //! 	Decode.formatError(e)
 //! ```
 
+import Std/Dict
 import Std/Dyn
 import Std/Float
 import Std/List
@@ -151,12 +152,25 @@ let errorAt = fn(segment: Segment, error: Error)
 
 /// Decode the child at `segment` of the value being decoded, so a failure
 /// underneath reports the whole path rather than the part of it the child could
-/// see. Every combinator that descends into a value goes through here.
+/// see. Every combinator in this module that descends into a value goes through
+/// here, and a hand-written one gets the same paths by doing the same — there is
+/// no need to build an [`Error`](#type-error) by hand, and no way for the
+/// sentence in it to fall out of step with the path.
+///
+/// ```scl
+/// let pair = fn(item: Decode.Decoder<Int>)
+/// 	fn(value: Any)
+/// 		let items = Dyn.asList(value);
+/// 		{
+/// 			left: Decode.at(.index(0), items[0] as Any, item),
+/// 			right: Decode.at(.index(1), items[1] as Any, item),
+/// 		}
+/// ```
 ///
 /// A `Std/Dyn` cast used as a decoder raises `UnexpectedType`, which carries no
 /// path at all; it becomes a `DecodeError` here, so a bare `Dyn.as*` composes
 /// like anything else.
-let at = fn<T>(segment: Segment, value: Any, decode: Decoder<T>)
+export let at = fn<T>(segment: Segment, value: Any, decode: Decoder<T>)
 	try decode(value)
 	catch DecodeError(e): raise DecodeError(errorAt(segment, e))
 	catch Dyn.UnexpectedType(message): raise DecodeError(
@@ -227,6 +241,94 @@ export let float: Decoder<Float> = fn(value)
 /// for the corner of a document whose shape is the consumer's business rather
 /// than the schema's.
 export let any: Decoder<Any> = fn(value) value
+
+/// The elements of a value read as a list, or a mismatch in its place.
+let asItems = casting("list", Dyn.asList)
+
+/// The entries of a value read as a table of like values.
+let asEntries = casting("dict", Dyn.asDict)
+
+/// The entries of a value read as a record. Objects of a parsed document arrive
+/// as dicts either way; what differs is the word a rejected value is reported
+/// with, which should be the one the schema was written in.
+let asFields = casting("record", Dyn.asDict)
+
+/// Decode every element of a list, keeping their order.
+///
+/// A failure inside an element names the position it was at, counted from zero:
+/// `at $[1]: expected Int, got "two"`.
+///
+/// ```scl
+/// Decode.list(Decode.int)(Encoding.fromJson("[1, 2, 3]"))   // [1, 2, 3]
+/// ```
+export let list = fn<T>(item: Decoder<T>)
+	fn(value: Any)
+		let items = asItems(value);
+		[for (i in List.range(List.length(items))) at(.index(i), items[i] as Any, item)]
+
+/// The key of a table entry. A decoded table is keyed by `Str`, so a key of any
+/// other type is one the table it was read into could not hold.
+let asKey = casting("Str key", Dyn.asStr)
+
+/// One entry of a decoded table: its key checked to be a string, and its value
+/// decoded under that key so a failure names it.
+let entryOf = fn<T>(entry: { key: Any, value: Any }, item: Decoder<T>)
+	let key = asKey(entry.key);
+	{ key, value: at(.field(key), entry.value, item) }
+
+/// Decode every value of a table whose keys are not known in advance — a set of
+/// named things, all of one shape. Keys are kept as they are and must be
+/// strings; anything else is rejected as `Str key`.
+///
+/// A failure inside a value names the key it was under: `at $.web: expected Int,
+/// got "80"`. For a value whose keys *are* known in advance, and whose fields
+/// have different types, use [`record`](#record).
+///
+/// ```scl
+/// Decode.dict(Decode.int)(Encoding.fromJson("\{\"web\": 80, \"api\": 443}"))
+/// // #{"web": 80, "api": 443}
+/// ```
+export let dict = fn<T>(item: Decoder<T>)
+	fn(value: Any)
+		Dict.fromList([for (e in Dict.entries(asEntries(value))) entryOf(e, item)])
+
+/// Reads one field of a record: `field(name, decoder)` decodes the value under
+/// `name` and gives it back at the decoder's own type, so the fields of one
+/// record can each have a different type.
+///
+/// A builder closure must annotate its parameter with this type — `fn(field:
+/// Decode.Field)` — or the checker fixes the field function at a single type and
+/// the record does not compile.
+export type Field fn<U>(Str, Decoder<U>) U
+
+/// Decode a record by naming its fields. The builder is handed a `field`
+/// function and returns the record built from it; the type of the result is the
+/// type of what the builder returns.
+///
+/// ```scl
+/// let server = Decode.record(fn(field: Decode.Field) {
+/// 	name: field("name", Decode.str),
+/// 	port: field("port", Decode.int),
+/// })
+///
+/// server(Encoding.fromJson("\{\"name\": \"web\", \"port\": 8080}"))
+/// ```
+///
+/// Keys the builder does not ask for are ignored, so a document may carry more
+/// than a schema reads. A field the document does not carry is not a case of its
+/// own: the key reads as `nil`, exactly as indexing any dict with a missing key
+/// does, and the field's decoder rejects it — `at $.port: expected Int, got
+/// nil`. A field that is allowed to be missing or null says so in its decoder,
+/// which is where every other condition on a field is written too.
+export let record = fn<T>(build: fn(Field) T)
+	fn(value: Any)
+		let fields = asFields(value);
+		// The field function has to be bound bare, and the binding left
+		// unannotated: passing this lambda straight to `build`, or writing the
+		// type it has onto the `let`, does not typecheck.
+		let readField = fn<U>(name: Str, decode: Decoder<U>)
+			at(.field(name), fields[name] as Any, decode);
+		build(readField)
 
 let identifierStart = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_"
 
@@ -405,6 +507,215 @@ Test.group(
 
 @test
 Test.group(
+	"list",
+	fn()
+		Test.it(
+			"reads every element",
+			fn() Test.expect(list(int)(Encoding.fromJson("[1, 2, 3]"))).toEqual([1, 2, 3]),
+		);
+		Test.it(
+			"reads a list with nothing in it",
+			fn() Test.expect(list(str)(Encoding.fromJson("[]"))).toEqual([] as [Str]),
+		);
+		Test.it(
+			"refuses a value that is not a list",
+			fn()
+				Test.expect(failureOf(list(int), Encoding.fromJson("\{\"a\": 1}"))).toEqual(
+					atRoot("list", "#\{\"a\": 1}"),
+				),
+		);
+		Test.it(
+			"names the position of an element it refuses",
+			fn()
+				let error = failureOf(list(int), Encoding.fromJson("[1, \"two\", 3]"));
+				Test.expect(error).toEqual(atPath([.index(1)], "Int", "\"two\""));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $[1]: expected Int, got \"two\""),
+		);
+		Test.it(
+			"counts positions from zero",
+			fn()
+				Test.expect(failureOf(list(int), Encoding.fromJson("[\"one\"]")).path).toEqual([
+					.index(0),
+				]),
+		);
+		Test.it(
+			"names the position at every level of nesting",
+			fn()
+				Test.expect(failureOf(list(list(int)), Encoding.fromJson("[[1], [2, \"x\"]]"))).toEqual(
+					atPath([.index(1), .index(1)], "Int", "\"x\""),
+				),
+		),
+)
+
+@test
+Test.group(
+	"dict",
+	fn()
+		Test.it(
+			"gives back a dict at the decoded type",
+			fn()
+				Test.expect(dict(int)(Encoding.fromJson("\{\"web\": 80}"))).toEqual(#{ "web": 80 }),
+		);
+		Test.it(
+			"reads every value under the key it was under",
+			fn()
+				let value = dict(int)(Encoding.fromJson("\{\"web\": 80, \"api\": 443}"));
+				Test.expect(Dict.size(value)).toEqual(2);
+				Test.expect(value["web"]).toEqual(80 as Int?);
+				Test.expect(value["api"]).toEqual(443 as Int?),
+		);
+		Test.it(
+			"reads a table with nothing in it",
+			fn() Test.expect(Dict.size(dict(str)(Encoding.fromJson("\{}")))).toEqual(0),
+		);
+		Test.it(
+			"refuses a value that is not a dict",
+			fn()
+				Test.expect(failureOf(dict(int), Encoding.fromJson("[1]"))).toEqual(
+					atRoot("dict", "[1]"),
+				),
+		);
+		Test.it(
+			"names the key of a value it refuses",
+			fn()
+				let error = failureOf(dict(int), Encoding.fromJson("\{\"web\": \"80\"}"));
+				Test.expect(error).toEqual(atPath([.field("web")], "Int", "\"80\""));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.web: expected Int, got \"80\""),
+		);
+		Test.it(
+			"refuses a key that is not a string",
+			fn()
+				Test.expect(failureOf(dict(str), #{ 1: "a" } as Any)).toEqual(
+					atRoot("Str key", "1"),
+				),
+		),
+)
+
+// A record of two fields of unrelated types, read on its own here and through a
+// level of nesting further down.
+@test let server = record(fn(field: Field) { name: field("name", str), port: field("port", int) })
+
+@test
+Test.group(
+	"record",
+	fn()
+		Test.it(
+			"reads the fields it names, each at its own type",
+			fn()
+				let value = server(Encoding.fromJson("\{\"name\": \"web\", \"port\": 8080}"));
+				Test.expect(value.name).toEqual("web");
+				Test.expect(value.port).toEqual(8080),
+		);
+		Test.it(
+			"ignores a key it was not asked for",
+			fn()
+				let json = "\{\"name\": \"web\", \"port\": 8080, \"region\": \"eu\"}";
+				Test.expect(server(Encoding.fromJson(json)).name).toEqual("web"),
+		);
+		Test.it(
+			"refuses a value that is not a record",
+			fn()
+				Test.expect(failureOf(server, Encoding.fromJson("[1]"))).toEqual(
+					atRoot("record", "[1]"),
+				),
+		);
+		Test.it(
+			"names the field of a value it refuses",
+			fn()
+				let json = "\{\"name\": \"web\", \"port\": \"80\"}";
+				let error = failureOf(server, Encoding.fromJson(json));
+				Test.expect(error).toEqual(atPath([.field("port")], "Int", "\"80\""));
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.port: expected Int, got \"80\""),
+		);
+		Test.it(
+			"reads a key that is not there as the nil it stands for",
+			fn()
+				Test.expect(failureOf(server, Encoding.fromJson("\{\"name\": \"web\"}"))).toEqual(
+					atPath([.field("port")], "Int", "nil"),
+				),
+		);
+		Test.it(
+			"reads a key written as null no differently",
+			fn()
+				let json = "\{\"name\": \"web\", \"port\": null}";
+				Test.expect(failureOf(server, Encoding.fromJson(json))).toEqual(
+					atPath([.field("port")], "Int", "nil"),
+				),
+		),
+)
+
+// A record whose one field is a list of records, for a path that runs through
+// more than one level of nesting.
+@test let config = record(fn(field: Field) { servers: field("servers", list(server)) })
+
+@test
+Test.group(
+	"a value nested more than one level deep",
+	fn()
+		Test.it(
+			"is read through every level",
+			fn()
+				let json = "\{\"servers\": [\{\"name\": \"web\", \"port\": 8080}]}";
+				let value = config(Encoding.fromJson(json));
+				Test.expect(List.map(value.servers, fn(s) s.port)).toEqual([8080]),
+		);
+		Test.it(
+			"is named by the whole path down to it when it is refused",
+			fn()
+				let json = "\{\"servers\": [\{\"name\": \"web\", \"port\": \"80\"}]}";
+				let error = failureOf(config, Encoding.fromJson(json));
+				Test.expect(error).toEqual(
+					atPath([.field("servers"), .index(0), .field("port")], "Int", "\"80\""),
+				);
+				Test.expect(error.message).toEqual(formatError(error));
+				Test.expect(error.message).toEqual("at $.servers[0].port: expected Int, got \"80\""),
+		),
+)
+
+// A shape that contains itself.
+@test type Tree { name: Str, children: [Tree] }
+
+// A decoder for that shape, referring to itself while it is being written. That
+// is all a recursive shape needs: no combinator stands between a decoder and the
+// one it contains. A binding that refers to itself has to be written as a
+// function of the value, rather than as the decoder the combinator returns, for
+// the recursion to be one the checker accepts.
+@test
+let tree = fn(value: Any)
+	record(
+		fn(field: Field)
+			{ name: field("name", str), children: field("children", list(tree)) } as Tree,
+	)(value)
+
+@test
+Test.group(
+	"a shape that contains itself",
+	fn()
+		Test.it(
+			"is read to the bottom",
+			fn()
+				let json = "\{\"name\": \"root\", \"children\": [\{\"name\": \"leaf\", \"children\": []}]}";
+				let value = tree(Encoding.fromJson(json));
+				Test.expect(value.name).toEqual("root");
+				Test.expect(List.map(value.children, fn(child) child.name)).toEqual(["leaf"]),
+		);
+		Test.it(
+			"names the path down through the levels it read",
+			fn()
+				let json = "\{\"name\": \"root\", \"children\": [\{\"name\": 1, \"children\": []}]}";
+				let error = failureOf(tree, Encoding.fromJson(json));
+				Test.expect(error).toEqual(
+					atPath([.field("children"), .index(0), .field("name")], "Str", "1"),
+				);
+				Test.expect(error.message).toEqual("at $.children[0].name: expected Str, got 1"),
+		),
+)
+
+@test
+Test.group(
 	"fail",
 	fn()
 		Test.it(
@@ -518,6 +829,20 @@ Test.group(
 				);
 				Test.expect(error.message).toEqual(formatError(error));
 				Test.expect(error.message).toEqual("at $[0].port: expected Int, got \"80\""),
+		);
+		Test.it(
+			"is what a container combinator written by hand descends with",
+			fn()
+				let pair = fn(item: Decoder<Int>)
+					fn(value: Any)
+						{
+							left: at(.index(0), Dyn.asList(value)[0] as Any, item),
+							right: at(.index(1), Dyn.asList(value)[1] as Any, item),
+						};
+				Test.expect(pair(int)(Encoding.fromJson("[1, 2]")).right).toEqual(2);
+				let error = failureOf(pair(int), Encoding.fromJson("[1, \"two\"]"));
+				Test.expect(error).toEqual(atPath([.index(1)], "Int", "\"two\""));
+				Test.expect(error.message).toEqual(formatError(error)),
 		),
 )
 
