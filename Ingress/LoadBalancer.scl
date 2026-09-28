@@ -4,6 +4,7 @@ import Skyr/Container
 import Std/Dict
 import Std/List
 import Std/Plugin
+import Std/Secret
 import Std/Str
 import Std/Time
 
@@ -65,14 +66,13 @@ export type Certificate {
 	/// private key with whichever certificate leads it. Public material, so it
 	/// travels as text.
 	fullChain: Str,
-	/// The Secret Version QID of the matching PEM-encoded private key —
-	/// `Secret.get("my-tls-key").qid` at the call site. The plaintext is
+	/// A Secret.Ref to the matching PEM-encoded private key. The plaintext is
 	/// resolved inside the platform when a replica materializes, so it enters
 	/// neither this configuration nor the inputs Skyr stores.
 	///
 	/// The replicas belong to this ingress, so its deployment role needs
 	/// `secret:View` on the secret — a grant the rule's own repository makes.
-	privateKey: Str,
+	privateKey: Secret.Ref,
 }
 
 export type FrontendOptions {
@@ -172,6 +172,10 @@ let probeModeErrors = fn(caps: Capabilities, p: Probe)
 			else
 				["the http health probe {path} needs an http frontend"]
 
+let secretVersionQid = fn(secret: Secret.Ref)
+	switch secret
+		case .version(qid): qid
+
 /// Everything wrong with the certificate a rule brings, which is nothing at
 /// all when it brings none.
 let certificateErrors = fn(caps: Capabilities, tls: Certificate?)
@@ -182,7 +186,7 @@ let certificateErrors = fn(caps: Capabilities, tls: Certificate?)
 				"a rule certificate needs a frontend that terminates TLS",
 			if (!Str.startsWith(cert.fullChain, "-----BEGIN "))
 				"a rule certificate chain must be PEM-encoded",
-			if (Str.isEmpty(cert.privateKey))
+			if (Str.isEmpty(secretVersionQid(cert.privateKey)))
 				"a rule certificate needs the secret version qid of its private key",
 		]
 
@@ -714,7 +718,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 				checkIntervalMs: hc.intervalMs,
 				certificate: switch rule.tls
 					case nil: nil
-					case cert: { certificatePem: cert.fullChain, privateKeyQid: cert.privateKey },
+					case cert: { certificatePem: cert.fullChain, privateKey: cert.privateKey },
 			},
 	];
 	let proxy = HAProxy.Proxy(
@@ -768,7 +772,10 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 @test import Std/Test
 
 @test
-let testCert = { certificatePem: "-----BEGIN CERTIFICATE-----\n", privateKeyQid: "org/repo!k@1" }
+let testCert = {
+	certificatePem: "-----BEGIN CERTIFICATE-----\n",
+	privateKey: .version("org/repo!k@1"),
+}
 
 @test
 let testFe = fn(name: Str, port: Int, mode: Mode)
@@ -1199,8 +1206,8 @@ Test.group(
 				// all a cleartext one carries.
 				Test.expect(config.frontends["http"]?.bindArgs?.tokens).toEqual(["mss", "1220"]);
 				Test.expect(Dict.keys(config.certificateLists ?? #{})).toEqual(["https"]);
-				Test.expect((config.certificates ?? #{})["cert-r1"]?.privateKeyQid).toEqual(
-					"org/repo!k@1",
+				Test.expect((config.certificates ?? #{})["cert-r1"]?.privateKey).toEqual(
+					.version("org/repo!k@1"),
 				),
 		);
 		Test.it(
@@ -1377,11 +1384,11 @@ i.Rule({
 	frontend: .https,
 	matchers: [.host("my-host.example.com")],
 	backends: [{ address: "my-host", port: 8080 }],
-	// In a deployment the key is `Secret.get("my-tls-key").qid`; a test run
-	// resolves no secrets, so it stands in as a literal qid here.
+	// A deployment passes the owning resource's Secret.Ref; this test uses a
+	// literal version reference because test runs do not resolve resources.
 	tls: {
 		fullChain: "-----BEGIN CERTIFICATE-----\n",
-		privateKey: "my-org/my-repo!my-tls-key@abc",
+		privateKey: .version("my-org/my-repo!my-tls-key@abc"),
 	},
 })
 
@@ -1449,7 +1456,7 @@ Test.it(
 					frontend: .http,
 					matchers: [.host("plain.example.com")],
 					backends: [{ address: "my-host", port: 8080 }],
-					tls: { fullChain: "-----BEGIN CERTIFICATE-----\n", privateKey: "q" },
+					tls: { fullChain: "-----BEGIN CERTIFICATE-----\n", privateKey: .version("q") },
 				}),
 		).toRaise(InvalidRule),
 )
@@ -1464,7 +1471,7 @@ Test.it(
 					frontend: .https,
 					matchers: [.host("bad-pem.example.com")],
 					backends: [{ address: "my-host", port: 8080 }],
-					tls: { fullChain: "./cert.pem", privateKey: "q" },
+					tls: { fullChain: "./cert.pem", privateKey: .version("q") },
 				}),
 		).toRaise(InvalidRule),
 )

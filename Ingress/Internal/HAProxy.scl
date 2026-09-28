@@ -2,6 +2,7 @@ import Std/List
 import Std/Str
 import Std/Test
 import Std/Dict
+import Std/Secret
 import Skyr/Container as C
 
 export type ConfigFile {
@@ -48,12 +49,11 @@ let formatStatement: fn(ConfigStatement) Str = fn(stmt)
 		line
 
 /// The TLS material one terminating bind needs. The chain is public, so it
-/// travels as PEM text; the key stays a Secret Version QID, whose plaintext is
-/// resolved inside the platform when a pod materializes and never enters this
-/// program.
+/// travels as PEM text; the key stays a Secret.Ref, whose plaintext is resolved
+/// inside the platform when a pod materializes and never enters this program.
 export type Certificate {
 	certificatePem: Str,
-	privateKeyQid: Str,
+	privateKey: Secret.Ref,
 }
 
 export type Config {
@@ -174,7 +174,7 @@ export let Proxy = fn(config: Config)
 			for (e in Dict.entries(certificates))
 				certificateFile(e.key): .literal(e.value.certificatePem),
 			for (e in Dict.entries(certificates))
-				"{certificateFile(e.key)}.key": .secret(e.value.privateKeyQid),
+				"{certificateFile(e.key)}.key": .secret(e.value.privateKey),
 		},
 	});
 	let image = "haproxy:{config.version}-alpine";
