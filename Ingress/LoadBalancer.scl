@@ -945,7 +945,7 @@ Test.group(
 					rules: [],
 				});
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind *:80 mss 1220\n\tmode http\n\toption httplog\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind :::80 v4v6 mss 1220\n\tmode http\n\toption httplog\n",
 				),
 		);
 		Test.it(
@@ -1020,7 +1020,7 @@ Test.group(
 					"h2,http/1.1",
 				]);
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind *:443 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
+					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind :::443 v4v6 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
 				),
 		);
 		Test.it(
