@@ -135,10 +135,16 @@ export let configSections: fn(Config) [ConfigSection] = fn(config)
 			{
 				heading: configBuilder.statement("frontend {feEntry.key}"),
 				statements: [
+					// Dual-stack, on purpose. A pod's public entry point is its IPv6
+					// address, and a VM pod's traffic to it is never translated: a
+					// `*:` bind is IPv4-only, so it would refuse every connection
+					// arriving over IPv6. `v4v6` keeps the IPv4 listener regardless of
+					// the host's `bindv6only`, which serves a bound internet address.
 					{
 						tokens: [
 							"bind",
-							"*:{feEntry.value.bind}",
+							":::{feEntry.value.bind}",
+							"v4v6",
 							if (feEntry.value.bindArgs != nil)
 								in feEntry.value.bindArgs.tokens,
 						],
