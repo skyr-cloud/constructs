@@ -3,6 +3,7 @@ import Skyr/Resource
 import Skyr/Net
 import Std/Dict
 import Std/List
+import Std/Num
 import Std/Plugin
 import Std/Secret
 import Std/Str
@@ -19,6 +20,24 @@ export type HealthCheck {
 	probe: Probe,
 }
 
+/// What a rule sends its requests to.
+export type Backend {
+	/// An address on the ingress network, or a name published on it.
+	address: Str,
+	port: Int,
+	/// How many of the addresses a name resolves to are served at once. A
+	/// name is one server unless this says otherwise, however many addresses
+	/// it answers with: the proxy picks one of them and the others get no
+	/// traffic. Set it to the number of workloads behind the name — the
+	/// replicas of a set, say — and each gets a server of its own, health
+	/// checked on its own and balanced with the rest, following the name as
+	/// its addresses change. A place the name has no address for stays out of
+	/// rotation until it has one.
+	///
+	/// Only for a backend named by a name: an address is always one server.
+	servers: Int?,
+}
+
 export type RuleTimeouts {
 	connect: Time.Duration?,
 	server: Time.Duration?,
@@ -27,10 +46,7 @@ export type RuleTimeouts {
 export type RuleOptions<TFrontend> {
 	frontend: TFrontend,
 	matchers: [Matcher],
-	backends: [{
-		address: Str,
-		port: Int,
-	}],
+	backends: [Backend],
 	timeouts: RuleTimeouts?,
 	healthCheck: HealthCheck?,
 	/// The certificate this rule's frontend should present for the hostnames
@@ -261,16 +277,36 @@ let ruleErrors = fn(
 			],
 	]
 
+/// Whether a backend's address is an address outright rather than a name to
+/// resolve: an IPv6 literal, which alone has colons, or four dotted numbers.
+let isAddress = fn(address: Str)
+	if (Str.contains(address, ":"))
+		true
+	else
+		let parts = Str.split(address, ".");
+		List.length(parts) == 4 && List.all(parts, fn(part) Num.fromStr(part) != nil)
+
+let backendErrors = fn(backends: [Backend])
+	[
+		for (be in backends)
+			in switch be.servers
+				case nil: [] as [Str]
+				case n:
+					if (n < 1)
+						["the backend {be.address} needs at least one server"]
+					else if (n > 1 && isAddress(be.address))
+						["the backend {be.address} is an address, which is one server"]
+					else
+						[],
+	]
+
 /// A rule instance normalized for config generation: durations already
 /// converted to milliseconds, matchers deduplicated, frontend key rendered.
 type PreparedRule {
 	hash: Str,
 	frontend: Str,
 	matchers: [Matcher],
-	backends: [{
-		address: Str,
-		port: Int,
-	}],
+	backends: [Backend],
 	timeoutConnectMs: Int?,
 	timeoutServerMs: Int?,
 	probe: Probe,
@@ -603,6 +639,17 @@ let serverAddress = fn(address: Str)
 	else
 		address
 
+/// How a backend's servers are declared. A `server` line is one server, and
+/// stays one when its name resolves to several addresses: HAProxy gives it one
+/// of them and never uses the rest. A `server-template` declares a numbered
+/// run of servers over the one name instead, hands each a different address
+/// from the answer, and leaves the ones it has no address for down.
+let serverDirective = fn(index: Int, servers: Int)
+	if (servers > 1)
+		"server-template server{index}- 1-{servers}"
+	else
+		"server server{index}"
+
 let backendStatements = fn(mode: Mode, rule: PreparedRule)
 	let b = HAProxy.configBuilder;
 	[
@@ -616,7 +663,7 @@ let backendStatements = fn(mode: Mode, rule: PreparedRule)
 			case .http(path): [b.statement("option httpchk GET {path}")],
 		for (e in List.zip(List.range(List.length(rule.backends)), rule.backends))
 			b.statement(
-				"server server{e.a + 1} {serverAddress(e.b.address)}:{e.b.port} check inter {rule.checkIntervalMs}",
+				"{serverDirective(e.a + 1, e.b.servers ?? 1)} {serverAddress(e.b.address)}:{e.b.port} check inter {rule.checkIntervalMs}",
 			),
 	]
 
@@ -849,13 +896,16 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 			switch opts.frontends[ruleOpts.frontend]
 				case nil: raise InvalidRule("rule references unknown frontend {ruleOpts.frontend}")
 				case fe:
-					let errors = ruleErrors(
-						capabilities(fe),
-						ruleOpts.matchers,
-						ruleOpts.timeouts,
-						ruleOpts.healthCheck,
-						ruleOpts.tls,
-					);
+					let errors = [
+						in ruleErrors(
+							capabilities(fe),
+							ruleOpts.matchers,
+							ruleOpts.timeouts,
+							ruleOpts.healthCheck,
+							ruleOpts.tls,
+						),
+						in backendErrors(ruleOpts.backends),
+					];
 					if (!List.isEmpty(errors))
 						raise InvalidRule(Str.join(errors, "; "))
 					else
@@ -1557,6 +1607,35 @@ Test.group(
 				]),
 		);
 		Test.it(
+			"gives a name as many servers as it is said to stand for",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [{
+						hash: "r1",
+						frontend: "http",
+						matchers: [.host("example.com")],
+						backends: [
+							{ address: "web.edge.internal", port: 8080, servers: 5 },
+							{ address: "api.edge.internal", port: 8080, servers: 1 },
+							{ address: "192.168.42.17", port: 8080 },
+						],
+						timeoutConnectMs: nil,
+						timeoutServerMs: nil,
+						probe: .connect,
+						checkIntervalMs: 2000,
+					}],
+				});
+				Test.expect(lines(config.backends["be-r1"])).toEqual([
+					"mode http",
+					"server-template server1- 1-5 web.edge.internal:8080 check inter 2000",
+					"server server2 api.edge.internal:8080 check inter 2000",
+					"server server3 192.168.42.17:8080 check inter 2000",
+				]),
+		);
+		Test.it(
 			"emits frontend client timeout overrides",
 			fn()
 				let config = buildConfig({
@@ -1644,6 +1723,53 @@ Test.it(
 					frontend: .http,
 					matchers: [.sni("db.example.com")],
 					backends: [{ address: "my-db", port: 5432 }],
+				}),
+		).toRaise(InvalidRule),
+)
+
+@test
+Test.it(
+	"tells a backend's address from a name",
+	fn()
+		Test.expect([
+			isAddress("192.168.42.17"),
+			isAddress("fdc0:a82a::17"),
+			isAddress("web.edge.internal"),
+			isAddress("web"),
+			isAddress("1.2.3.internal"),
+		]).toEqual([true, true, false, false, false]),
+)
+
+@test
+Test.it(
+	"accepts several servers for a name only, and at least one",
+	fn()
+		Test.expect(
+			backendErrors([
+				{ address: "web.edge.internal", port: 80, servers: 5 },
+				{ address: "web.edge.internal", port: 80 },
+				{ address: "192.168.42.17", port: 80, servers: 1 },
+				{ address: "192.168.42.17", port: 80, servers: 2 },
+				{ address: "fdc0:a82a::17", port: 80, servers: 2 },
+				{ address: "web.edge.internal", port: 80, servers: 0 },
+			]),
+		).toEqual([
+			"the backend 192.168.42.17 is an address, which is one server",
+			"the backend fdc0:a82a::17 is an address, which is one server",
+			"the backend web.edge.internal needs at least one server",
+		]),
+)
+
+@test
+Test.it(
+	"rejects a rule asking an address for several servers",
+	fn()
+		Test.expect(
+			fn()
+				i.Rule({
+					frontend: .http,
+					matchers: [.host("many.example.com")],
+					backends: [{ address: "192.168.42.17", port: 8080, servers: 3 }],
 				}),
 		).toRaise(InvalidRule),
 )

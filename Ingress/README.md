@@ -78,6 +78,26 @@ ingress.Rule({
 })
 ```
 
+A name is one server, however many addresses it answers with: the proxy picks
+one of them and the rest get no traffic. To serve everything behind a name —
+the replicas of a `Rollout.ReplicaSet`, say — tell the backend how many
+`servers` the name stands for. Each then gets a server of its own, health
+checked on its own and balanced with the others, and follows the name as its
+addresses change:
+
+```scl
+let web = ingress.network.dns.A({
+	name: "web",
+	addresses: [for (replica in set.replicas) replica.host],
+})
+
+ingress.Rule({
+	frontend: .http,
+	matchers: [.host("example.com")],
+	backends: [{ address: web.fqdn, port: 8080, servers: 3 }],
+})
+```
+
 A workload cannot be on two networks whose ranges overlap, so give the ingress
 network ranges clear of the other networks its backends are on. Attaching to the
 network and publishing names on it from another repository are the network
