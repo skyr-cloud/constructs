@@ -1,6 +1,6 @@
 import Self/Internal/HAProxy
 import Skyr/Resource
-import Skyr/Container
+import Skyr/Net
 import Std/Dict
 import Std/List
 import Std/Plugin
@@ -76,8 +76,14 @@ export type Certificate {
 }
 
 export type FrontendOptions {
+	/// The port clients connect to: on every replica's public addresses for a
+	/// public frontend, on its address on the ingress network otherwise.
 	port: Int,
 	mode: Mode,
+	/// Publish the frontend on the replicas' public addresses, which is the
+	/// default. A frontend that is not public answers only on the ingress
+	/// network, where a replica cannot bind a port below 1024 — so its port has
+	/// to be at least that.
 	public: Bool?,
 	timeoutClient: Time.Duration?,
 	/// Terminate TLS on this frontend. The bind declares `strict-sni`, so a
@@ -93,17 +99,36 @@ export type IngressOptions<TFrontend> {
 	region: Str?,
 	replicas: Int,
 	replica: {
+		/// CPU limit of a replica's proxy, in millicores.
 		cpu: Int,
+		/// Memory limit of a replica's proxy, in bytes.
 		memory: Int,
+		/// Bytes of local storage a replica gets for its unpacked image and
+		/// its writable root filesystem. 1 GiB when omitted.
+		scratch: Int?,
+		/// Publish the public frontends on a public IPv4 address per replica
+		/// as well as on its IPv6 one.
 		ipv4: Bool?,
 	},
 	timeouts: Timeouts?,
 	frontends: #{TFrontend: FrontendOptions},
+	/// The private IPv4 range of the ingress network, `192.168.42.0/24` when
+	/// omitted.
 	networkCidr: Str?,
+	/// The unique local IPv6 range of the ingress network, `fdc0:a82a::/64`
+	/// when omitted. A workload cannot be on two networks whose ranges overlap,
+	/// so choose both ranges clear of the other networks the backends are on.
+	networkCidr6: Str?,
 }
 
 export type Ingress<TFrontend> {
-	network: Container.Network,
+	/// The network the replicas are on. A backend is reached over it, so
+	/// whatever a rule names as one needs a NIC on it; a name published with
+	/// its `dns` resolves for the replicas as `<name>.<ingress name>.internal`.
+	network: Net.Network,
+	/// The public addresses of each replica, which are those of a gateway of
+	/// its own and so outlive the proxy behind them. `ipv4` is `nil` unless
+	/// the replicas were asked to publish on IPv4.
 	addresses: [{ ipv4: Str?, ipv6: Str }],
 	Rule: fn(RuleOptions<TFrontend>) Rule<TFrontend>,
 }
@@ -264,6 +289,50 @@ type FrontendSpec {
 
 let frontendCapabilities = fn(fe: FrontendSpec)
 	{ mode: fe.mode, terminatesTls: fe.terminatesTls } as Capabilities
+
+/// The lowest port a replica's proxy can bind. It runs as the image's own
+/// unprivileged user, and the ports below this one are root's alone.
+let unprivilegedPortStart = 1024
+
+/// How far up a frontend on a privileged port listens instead. Nothing public
+/// can tell: a replica's gateway answers on the frontend's own port and
+/// forwards it here. Chosen to land below the range outgoing connections draw
+/// their source ports from by default, so a listener never competes with the
+/// proxy's own connections to its backends.
+let privilegedPortOffset = 30000
+
+/// The port a frontend's listener binds inside a replica.
+let listenPort = fn(port: Int)
+	if (port < unprivilegedPortStart)
+		port + privilegedPortOffset
+	else
+		port
+
+let isPublic = fn(fe: FrontendSpec) fe.public ?? true
+
+/// Everything wrong with an ingress's frontends, taken together. Checked as
+/// the ingress is declared, so a set of frontends no replica could serve fails
+/// the deployment instead of becoming a proxy that refuses to start.
+let frontendErrors = fn(frontends: [FrontendSpec])
+	let indexed = [
+		for (e in List.zip(List.range(List.length(frontends)), frontends))
+			{ index: e.a, fe: e.b, bound: listenPort(e.b.port) },
+	];
+	[
+		for (fe in frontends)
+			if (fe.port < 1 || fe.port > 65535)
+				"the port {fe.port} of frontend {fe.name} is out of range: ports are 1 to 65535",
+		for (fe in frontends)
+			if (!isPublic(fe) && fe.port >= 1 && fe.port < unprivilegedPortStart)
+				"frontend {fe.name} is not public, so it is reached on the port a replica itself binds, and a replica cannot bind port {fe.port}: use {unprivilegedPortStart} or above",
+		for (a in indexed)
+			for (b in indexed)
+				if (a.index < b.index && a.bound == b.bound)
+					if (a.fe.port == b.fe.port)
+						"frontends {a.fe.name} and {b.fe.name} share port {a.fe.port}"
+					else
+						"frontends {a.fe.name} and {b.fe.name} would both listen on port {a.bound} inside a replica, where a port below {unprivilegedPortStart} is served from {privilegedPortOffset} above it",
+	]
 
 type LiveRule {
 	caps: Capabilities,
@@ -464,7 +533,8 @@ let ruleRouting = fn(r: RoutedRule)
 /// one never does. Nothing here can make that message arrive, so the segments
 /// are kept small enough that none is needed — 1220 is the 1280-byte IPv6
 /// minimum MTU less the 40-byte IPv6 and 20-byte TCP headers, a size every
-/// path must carry.
+/// path must carry. A replica's gateway clamps too, but to the MTU of the
+/// ingress network, which says nothing about the path beyond the gateway.
 ///
 /// It goes on every bind, not just a terminating one. A handshake's
 /// certificate flight is merely the first response large enough to notice; a
@@ -481,7 +551,7 @@ let frontendSection = fn(
 	let mine = [for (r in routed) if (r.rule.frontend == fe.name) r];
 	let myDropped = [for (d in dropped) if (d.rule.frontend == fe.name) d];
 	{
-		bind: fe.port,
+		bind: listenPort(fe.port),
 		// The certificates are a list rather than a single `crt` because each
 		// arrives with a rule. `strict-sni` refuses a handshake no listed
 		// certificate matches, instead of answering it with whichever one
@@ -500,7 +570,7 @@ let frontendSection = fn(
 				" ",
 			),
 		),
-		public: fe.public,
+		publicPort: if (isPublic(fe)) fe.port,
 		statements: [
 			b.statement("mode {fe.mode}"),
 			b.statement(if (fe.mode == .http) "option httplog" else "option tcplog"),
@@ -525,6 +595,14 @@ let frontendSection = fn(
 		],
 	}
 
+/// A backend's address as a `server` line takes it. An IPv6 literal is
+/// bracketed, since its own colons would otherwise swallow the port.
+let serverAddress = fn(address: Str)
+	if (Str.contains(address, ":"))
+		"[{address}]"
+	else
+		address
+
 let backendStatements = fn(mode: Mode, rule: PreparedRule)
 	let b = HAProxy.configBuilder;
 	[
@@ -538,7 +616,7 @@ let backendStatements = fn(mode: Mode, rule: PreparedRule)
 			case .http(path): [b.statement("option httpchk GET {path}")],
 		for (e in List.zip(List.range(List.length(rule.backends)), rule.backends))
 			b.statement(
-				"server server{e.a + 1} {e.b.address}:{e.b.port} check inter {rule.checkIntervalMs}",
+				"server server{e.a + 1} {serverAddress(e.b.address)}:{e.b.port} check inter {rule.checkIntervalMs}",
 			),
 	]
 
@@ -559,10 +637,13 @@ let resolversName = "internal"
 let baseSections = fn(t: { connectMs: Int, clientMs: Int, serverMs: Int })
 	let b = HAProxy.configBuilder;
 	[
-		b.section(
-			b.statement("global"),
-			[b.statement("log stdout format raw local0 info"), b.statement("maxconn 4096")],
-		),
+		// No `maxconn`, on purpose. Every connection takes two file descriptors,
+		// and how many a replica may open is a limit the platform hands the
+		// process, which its unprivileged user cannot raise: a figure written
+		// here either wastes that limit or exceeds it, and exceeding it is an
+		// error HAProxy will not start past. Left out, HAProxy derives the
+		// largest `maxconn` the limit allows.
+		b.section(b.statement("global"), [b.statement("log stdout format raw local0 info")]),
 		// Whichever nameservers the platform already handed the pod: their
 		// addresses appear nowhere in SCL, and this is the same file the startup
 		// resolution reads regardless.
@@ -682,6 +763,17 @@ let preparedCheck = fn(hc: HealthCheck?)
 		case nil: { probe: .connect, intervalMs: 2000 }
 		case h: { probe: h.probe, intervalMs: Time.toMilliseconds(h.interval) }
 
+let checkedFrontends = fn(frontends: [FrontendSpec])
+	let errors = frontendErrors(frontends);
+	if (!List.isEmpty(errors))
+		raise InvalidOptions(Str.join(errors, "; "))
+	else
+		frontends
+
+/// What a replica gets for its unpacked image and writable root when the
+/// ingress does not say: 1 GiB, many times the size of the proxy's image.
+let defaultScratch = 1073741824
+
 export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 	let resolvedTimeouts = switch opts.timeouts
 		case nil: { connectMs: 5000, clientMs: 30000, serverMs: 30000 }
@@ -691,7 +783,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 				clientMs: msOr(t.client, 30000),
 				serverMs: msOr(t.server, 30000),
 			};
-	let frontendSpecs = [
+	let frontendSpecs = checkedFrontends([
 		for (fe in Dict.entries(opts.frontends))
 			{
 				name: "{fe.key}",
@@ -701,7 +793,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 				timeoutClientMs: msOrNil(fe.value.timeoutClient),
 				terminatesTls: fe.value.tls == .terminate,
 			},
-	];
+	]);
 	let ruleDef = Resource.Definition<RuleOptions<TFrontend>>("Rule");
 	let rules = [
 		for (rule in ruleDef.instances)
@@ -729,9 +821,14 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 			rules,
 		}),
 	);
-	let network = Container.Network({
+	// Dual-stack: a replica's gateway forwards each address family to the
+	// replica's address of that same family, so the network needs both for the
+	// frontends to be reachable over both.
+	let network = Net.Network({
 		name: opts.name,
-		cidr: opts.networkCidr ?? "192.168.42.0/24",
+		region: opts.region,
+		ipv4: opts.networkCidr ?? "192.168.42.0/24",
+		ipv6: opts.networkCidr6 ?? "fdc0:a82a::/64",
 	});
 	let addresses = [
 		for (i in List.range(opts.replicas))
@@ -740,7 +837,8 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 				region: opts.region,
 				cpu: opts.replica.cpu,
 				memory: opts.replica.memory,
-				networks: #{ "ing0": network },
+				scratch: opts.replica.scratch ?? defaultScratch,
+				network,
 				withPublicIPv4: opts.replica.ipv4,
 			}),
 	];
@@ -784,6 +882,10 @@ let testFe = fn(name: Str, port: Int, mode: Mode)
 @test
 let testTlsFe = fn(name: Str, port: Int, mode: Mode)
 	{ name, port, mode, public: nil, timeoutClientMs: nil, terminatesTls: true } as FrontendSpec
+
+@test
+let testPrivateFe = fn(name: Str, port: Int, mode: Mode)
+	{ name, port, mode, public: false, timeoutClientMs: nil, terminatesTls: false } as FrontendSpec
 
 @test let plaintext = { mode: .http, terminatesTls: false } as Capabilities
 
@@ -933,8 +1035,94 @@ Test.group(
 
 @test
 Test.group(
+	"frontendErrors",
+	fn()
+		Test.it(
+			"accepts public frontends on privileged ports beside a private one",
+			fn()
+				Test.expect(
+					frontendErrors([
+						testFe("http", 80, .http),
+						testTlsFe("https", 443, .http),
+						testPrivateFe("internal", 8080, .http),
+					]),
+				).toEqual([] as [Str]),
+		);
+		Test.it(
+			"rejects a private frontend on a port a replica cannot bind",
+			fn()
+				Test.expect(frontendErrors([testPrivateFe("internal", 80, .http)])).toEqual([
+					"frontend internal is not public, so it is reached on the port a replica itself binds, and a replica cannot bind port 80: use 1024 or above",
+				]),
+		);
+		Test.it(
+			"rejects two frontends on one port",
+			fn()
+				Test.expect(
+					frontendErrors([testFe("a", 8080, .http), testPrivateFe("b", 8080, .tcp)]),
+				).toEqual(["frontends a and b share port 8080"]),
+		);
+		Test.it(
+			"rejects a frontend on the port a privileged one is served from",
+			fn()
+				Test.expect(
+					frontendErrors([testFe("http", 80, .http), testFe("other", 30080, .http)]),
+				).toEqual([
+					"frontends http and other would both listen on port 30080 inside a replica, where a port below 1024 is served from 30000 above it",
+				]),
+		);
+		Test.it(
+			"rejects a port outside the range there is",
+			fn()
+				Test.expect(
+					frontendErrors([testFe("zero", 0, .http), testFe("high", 65536, .http)]),
+				).toEqual([
+					"the port 0 of frontend zero is out of range: ports are 1 to 65535",
+					"the port 65536 of frontend high is out of range: ports are 1 to 65535",
+				]),
+		),
+)
+
+@test
+Test.group(
 	"buildConfig",
 	fn()
+		Test.it(
+			"serves a privileged port from an unprivileged one, published on its own",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [],
+				});
+				Test.expect(config.frontends["http"]?.bind).toEqual(30080);
+				Test.expect(config.frontends["http"]?.publicPort).toEqual(80),
+		);
+		Test.it(
+			"binds an unprivileged port as it is",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("alt", 8443, .tcp)],
+					rules: [],
+				});
+				Test.expect(config.frontends["alt"]?.bind).toEqual(8443);
+				Test.expect(config.frontends["alt"]?.publicPort).toEqual(8443),
+		);
+		Test.it(
+			"publishes no port for a frontend that is not public",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testPrivateFe("internal", 8080, .http)],
+					rules: [],
+				});
+				Test.expect(config.frontends["internal"]?.bind).toEqual(8080);
+				Test.expect(config.frontends["internal"]?.publicPort).toEqual(nil),
+		);
 		Test.it(
 			"formats a valid config with zero rules",
 			fn()
@@ -945,7 +1133,7 @@ Test.group(
 					rules: [],
 				});
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind :::80 v4v6 mss 1220\n\tmode http\n\toption httplog\n",
+					"global\n\tlog stdout format raw local0 info\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind :::30080 v4v6 mss 1220\n\tmode http\n\toption httplog\n",
 				),
 		);
 		Test.it(
@@ -1020,7 +1208,7 @@ Test.group(
 					"h2,http/1.1",
 				]);
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\tmaxconn 4096\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind :::443 v4v6 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
+					"global\n\tlog stdout format raw local0 info\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind :::30443 v4v6 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
 				),
 		);
 		Test.it(
@@ -1340,6 +1528,35 @@ Test.group(
 				]),
 		);
 		Test.it(
+			"brackets a backend's IPv6 address, and leaves names and IPv4 as they are",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [{
+						hash: "r1",
+						frontend: "http",
+						matchers: [.host("example.com")],
+						backends: [
+							{ address: "fdc0:a82a::17", port: 8080 },
+							{ address: "192.168.42.17", port: 8080 },
+							{ address: "api.edge.internal", port: 8080 },
+						],
+						timeoutConnectMs: nil,
+						timeoutServerMs: nil,
+						probe: .connect,
+						checkIntervalMs: 2000,
+					}],
+				});
+				Test.expect(lines(config.backends["be-r1"])).toEqual([
+					"mode http",
+					"server server1 [fdc0:a82a::17]:8080 check inter 2000",
+					"server server2 192.168.42.17:8080 check inter 2000",
+					"server server3 api.edge.internal:8080 check inter 2000",
+				]),
+		);
+		Test.it(
 			"emits frontend client timeout overrides",
 			fn()
 				let config = buildConfig({
@@ -1369,7 +1586,7 @@ let i = Proxy({
 	replicas: 4,
 	replica: {
 		cpu: 500,
-		memory: 1024 * 32,
+		memory: 256 * 1024 * 1024,
 	},
 	timeouts: { connect: Time.second, client: nil, server: Time.multiply(Time.minute, 1) },
 	frontends: #{
@@ -1474,4 +1691,22 @@ Test.it(
 					tls: { fullChain: "./cert.pem", privateKey: .version("q") },
 				}),
 		).toRaise(InvalidRule),
+)
+
+@test
+Test.it(
+	"rejects frontends no replica could serve before declaring anything",
+	fn()
+		Test.expect(
+			fn()
+				Proxy({
+					name: "bad-ingress",
+					replicas: 1,
+					replica: { cpu: 500, memory: 256 * 1024 * 1024 },
+					frontends: #{
+						.http: { port: 80, mode: .http },
+						.internal: { port: 81, mode: .http, public: false },
+					},
+				}),
+		).toRaise(InvalidOptions),
 )
