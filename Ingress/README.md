@@ -120,3 +120,19 @@ zone.ARecord({
 	addresses: [for (a in ingress.addresses) if (a.ipv4 != nil) a.ipv4],
 })
 ```
+
+### Forwarded headers
+
+A frontend in `mode: .http` tells its backends how the client reached it, with
+three headers set on every request:
+
+| Header | Value |
+| --- | --- |
+| `X-Forwarded-Proto` | `https` on a frontend that terminates TLS, `http` on one that does not |
+| `X-Forwarded-Host` | the `Host` the client asked for, port included if it sent one |
+| `X-Forwarded-For` | the client's address |
+
+The proxy is the edge, so it sets these rather than appends to them: whatever a
+client sends under these names is discarded, and a backend can trust what it
+reads. `Host` itself reaches the backend as the client sent it. A `tcp`
+frontend, terminating TLS or not, has no headers to set and adds none.
