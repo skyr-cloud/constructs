@@ -49,6 +49,26 @@ A frontend with `public: false` is published on no gateway. It answers on the
 replicas' own addresses on the ingress network, on its `port` as written — which
 therefore has to be 1024 or above.
 
+### Redirect HTTP to HTTPS
+
+To redirect all requests from port 80 to HTTPS, set `redirectTo` on the
+cleartext HTTP frontend. Its value is the key of a TLS-terminating HTTP
+frontend in the same proxy:
+
+```scl
+frontends: #{
+	.http: { port: 80, mode: .http, redirectTo: .https },
+	.https: { port: 443, mode: .http, tls: .terminate },
+},
+```
+
+`http://example.com/shows?month=may` now receives a `301 Moved Permanently` to
+`https://example.com/shows?month=may`. The hostname, path and query come from
+the request. A non-default destination port is included (`:8443`, for example).
+There is no hostname or path filter: put the rules and their certificates on
+`.https`, not on the redirecting frontend. Without `redirectTo`, routing is
+unchanged.
+
 ### Backends
 
 A replica reaches a backend over the ingress network, so a backend needs a NIC

@@ -91,7 +91,10 @@ export type Certificate {
 	privateKey: Secret.Ref,
 }
 
-export type FrontendOptions {
+/// Options for a frontend that serves rules (no redirect target).
+export type FrontendOptions FrontendOptionsFor<Never>
+
+export type FrontendOptionsFor<TFrontend> {
 	/// The port clients connect to: on every replica's public addresses for a
 	/// public frontend, on its address on the ingress network otherwise.
 	port: Int,
@@ -108,6 +111,8 @@ export type FrontendOptions {
 	/// serves what it is given: cleartext in mode http, an opaque byte stream
 	/// in mode tcp.
 	tls: Tls?,
+	/// Redirect every request to this TLS-terminating HTTP frontend instead of serving rules.
+	redirectTo: TFrontend?,
 }
 
 export type IngressOptions<TFrontend> {
@@ -127,7 +132,7 @@ export type IngressOptions<TFrontend> {
 		ipv4: Bool?,
 	},
 	timeouts: Timeouts?,
-	frontends: #{TFrontend: FrontendOptions},
+	frontends: #{TFrontend: FrontendOptionsFor<TFrontend>},
 	/// The private IPv4 range of the ingress network, `192.168.42.0/24` when
 	/// omitted.
 	networkCidr: Str?,
@@ -171,7 +176,7 @@ type Capabilities {
 	terminatesTls: Bool,
 }
 
-let capabilities = fn(fe: FrontendOptions)
+let capabilities = fn<TFrontend>(fe: FrontendOptionsFor<TFrontend>)
 	{ mode: fe.mode, terminatesTls: fe.tls == .terminate } as Capabilities
 
 let speaksHttp = fn(c: Capabilities) c.mode == .http
@@ -321,6 +326,7 @@ type FrontendSpec {
 	public: Bool?,
 	timeoutClientMs: Int?,
 	terminatesTls: Bool,
+	redirectPort: Int?,
 }
 
 let frontendCapabilities = fn(fe: FrontendSpec)
@@ -345,6 +351,33 @@ let listenPort = fn(port: Int)
 		port
 
 let isPublic = fn(fe: FrontendSpec) fe.public ?? true
+
+let redirectPort = fn<T>(
+	source: T,
+	fe: FrontendOptionsFor<T>,
+	frontends: #{T: FrontendOptionsFor<T>},
+)
+	switch fe.redirectTo
+		case nil: nil
+		case target:
+			if (target == source)
+				raise InvalidOptions("frontend {source} cannot redirect to itself")
+			else if (fe.mode != .http || fe.tls != nil)
+				raise InvalidOptions("only a plain HTTP frontend can redirect: {source}")
+			else
+				switch frontends[target]
+					case nil: raise InvalidOptions(
+						"frontend {source} redirects to unknown frontend {target}",
+					)
+					case dest:
+						if (dest.mode != .http || !capabilities(dest).terminatesTls)
+							raise InvalidOptions(
+								"redirect target {target} must be a TLS-terminating HTTP frontend",
+							)
+						else
+							dest.port
+
+let noRedirectRules = "a redirecting frontend does not accept rules"
 
 /// Everything wrong with an ingress's frontends, taken together. Checked as
 /// the ingress is declared, so a set of frontends no replica could serve fails
@@ -628,7 +661,17 @@ let frontendSection = fn(
 			b.statement(if (fe.mode == .http) "option httplog" else "option tcplog"),
 			if (fe.timeoutClientMs != nil)
 				b.statement("timeout client {fe.timeoutClientMs}"),
-			in forwardedHeaders(fe),
+			if (fe.redirectPort == nil) in forwardedHeaders(fe),
+			if (fe.redirectPort != nil)
+				in let port = if (fe.redirectPort == 443) "" else ":{fe.redirectPort}";
+				[
+					b.statement(
+						"http-request deny deny_status 400 unless \{ req.hdr(host),host_only -m len gt 0 }",
+					),
+					b.statement(
+						"http-request redirect prefix https://%[req.hdr(host),host_only]{port} code 301",
+					),
+				],
 			for (d in myDropped)
 				let reason = Str.join(d.errors, "; ");
 				b.comment("dropped be-{d.rule.hash}: {reason}"),
@@ -742,14 +785,19 @@ let buildConfig = fn(
 		rules: [PreparedRule],
 	},
 )
-	let capsByFrontend = #{
-		for (fe in input.frontends) fe.name: frontendCapabilities(fe),
-	};
+	let byFrontend = #{ for (fe in input.frontends) fe.name: fe };
 	let candidates = [
 		for (r in input.rules)
-			switch capsByFrontend[r.frontend]
+			switch byFrontend[r.frontend]
 				case nil: { rule: r, caps: nil, errors: ["unknown frontend {r.frontend}"] }
-				case c: { rule: r, caps: c, errors: ruleModeErrors(c, r) },
+				case fe:
+					let caps = frontendCapabilities(fe);
+					{
+						rule: r,
+						caps,
+						errors: if (fe.redirectPort != nil) [noRedirectRules]
+						else ruleModeErrors(caps, r),
+					},
 	];
 	let dropped = [
 		for (c in candidates)
@@ -856,6 +904,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 				public: fe.value.public,
 				timeoutClientMs: msOrNil(fe.value.timeoutClient),
 				terminatesTls: fe.value.tls == .terminate,
+				redirectPort: redirectPort(fe.key, fe.value, opts.frontends),
 			},
 	]);
 	let ruleDef = Resource.Definition<RuleOptions<TFrontend>>("Rule");
@@ -914,6 +963,7 @@ export let Proxy = fn<TFrontend>(opts: IngressOptions<TFrontend>)
 				case nil: raise InvalidRule("rule references unknown frontend {ruleOpts.frontend}")
 				case fe:
 					let errors = [
+						if (fe.redirectTo != nil) noRedirectRules,
 						in ruleErrors(
 							capabilities(fe),
 							ruleOpts.matchers,
@@ -987,6 +1037,16 @@ let testCertRule = fn(hash: Str, frontend: Str, matchers: [Matcher])
 		checkIntervalMs: 2000,
 		certificate: testCert,
 	} as PreparedRule
+
+// Existing registered rules are keyed by this structural type hash (issue #6).
+@test
+Test.it(
+	"keeps the registered HTTP/HTTPS rule type stable",
+	fn()
+		Test.expect(Plugin.typeHash<RuleOptions<enum { .http, .https }>>()).toEqual(
+			"8b185310e0f1b265",
+		),
+)
 
 @test let defaultTimeouts = { connectMs: 5000, clientMs: 30000, serverMs: 30000 }
 
@@ -1922,4 +1982,108 @@ Test.it(
 					},
 				}),
 		).toRaise(InvalidOptions),
+)
+
+@test
+Test.group(
+	"HTTP redirects",
+	fn()
+		let target = #{ "https": { port: 443, mode: .http, tls: .terminate } };
+		let source = { port: 80, mode: .http, redirectTo: "https" };
+		let reject = fn(from: FrontendOptionsFor<Str>, to: #{Str: FrontendOptions})
+			Test.expect(fn() redirectPort("http", from, to)).toRaise(InvalidOptions);
+		Test.it(
+			"rejects unknown and self targets",
+			fn()
+				reject(source, #{});
+				let self = { port: 80, mode: .http, redirectTo: "http" };
+				Test.expect(fn() redirectPort("http", self, #{ "http": self })).toRaise(
+					InvalidOptions,
+				),
+		);
+		Test.it(
+			"requires a cleartext HTTP source",
+			fn()
+				reject({ port: 80, mode: .tcp, redirectTo: "https" }, target);
+				reject({ port: 80, mode: .http, tls: .terminate, redirectTo: "https" }, target),
+		);
+		Test.it(
+			"requires an HTTP destination that terminates TLS",
+			fn()
+				reject(source, #{ "https": { port: 443, mode: .http } });
+				reject(source, #{ "https": { port: 443, mode: .tcp, tls: .terminate } }),
+		);
+		Test.it(
+			"accepts a TLS rule on the destination but no rule on the source",
+			fn()
+				let https: FrontendOptions = { port: 443, mode: .http, tls: .terminate };
+				let ingress = Proxy({
+					name: "redirect-ingress",
+					replicas: 1,
+					replica: { cpu: 500, memory: 256 * 1024 * 1024 },
+					frontends: #{
+						.http: { port: 80, mode: .http, redirectTo: .https },
+						.https: https,
+					},
+				});
+				let matchers = [.host("example.com")];
+				let backends = [{ address: "10.0.0.1", port: 8080 }];
+				let _ = ingress.Rule({
+					frontend: .https,
+					matchers,
+					backends,
+					tls: { fullChain: testCert.certificatePem, privateKey: testCert.privateKey },
+				});
+				Test.expect(fn() ingress.Rule({ frontend: .http, matchers, backends })).toRaise(
+					InvalidRule,
+				),
+		),
+)
+
+@test
+let redirectConfig = fn(port: Int)
+	buildConfig({
+		version: "3.4",
+		timeouts: defaultTimeouts,
+		frontends: [
+			{ name: "http", port: 80, mode: .http, terminatesTls: false, redirectPort: port },
+			testTlsFe("https", port, .http),
+		],
+		rules: [
+			testRule("stale", "http", [.host("example.com")]),
+			testCertRule("live", "https", [.host("example.com")]),
+		],
+	})
+
+@test
+Test.it(
+	"redirects HTTP on the default HTTPS port without disrupting TLS rules",
+	fn()
+		let config = redirectConfig(443);
+		let source = config.frontends["http"]?.statements;
+		Test.expect([for (line in lines(source)) if (line != "") line]).toEqual([
+			"mode http",
+			"option httplog",
+			"http-request deny deny_status 400 unless \{ req.hdr(host),host_only -m len gt 0 }",
+			"http-request redirect prefix https://%[req.hdr(host),host_only] code 301",
+		]);
+		Test.expect(comments(source)).toEqual(["dropped be-stale: {noRedirectRules}"]);
+		Test.expect(Dict.keys(config.backends)).toEqual(["be-live"]);
+		Test.expect(useBackends(config.frontends["https"]?.statements)).toEqual([
+			"use_backend be-live if m-live-0",
+		]);
+		Test.expect(Dict.keys(config.certificates ?? #{})).toEqual(["cert-live"]),
+)
+
+@test
+Test.it(
+	"includes a nondefault HTTPS port in the redirect",
+	fn()
+		let config = redirectConfig(8443);
+		Test.expect([
+			for (line in lines(config.frontends["http"]?.statements))
+				if (Str.startsWith(line, "http-request redirect")) line,
+		]).toEqual([
+			"http-request redirect prefix https://%[req.hdr(host),host_only]:8443 code 301",
+		]),
 )
