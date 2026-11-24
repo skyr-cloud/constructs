@@ -577,6 +577,22 @@ let ruleRouting = fn(r: RoutedRule)
 /// proxied page is the next.
 let clampedMss = 1220
 
+/// What an http frontend tells its backends about the request as the client
+/// made it. The proxy is the edge, so whatever the client sent under these
+/// names is discarded rather than appended to: a backend can trust them.
+/// `Host` is left as the client sent it. A tcp frontend has no headers to set.
+let forwardedHeaders = fn(fe: FrontendSpec)
+	let b = HAProxy.configBuilder;
+	let proto = if (fe.terminatesTls) "https" else "http";
+	if (fe.mode == .http)
+		[
+			b.statement("http-request set-header X-Forwarded-Proto {proto}"),
+			b.statement("http-request set-header X-Forwarded-Host %[req.hdr(host)]"),
+			b.statement("http-request set-header X-Forwarded-For %[src]"),
+		]
+	else
+		[] as [HAProxy.ConfigStatement]
+
 let frontendSection = fn(
 	fe: FrontendSpec,
 	routed: [RoutedRule],
@@ -612,6 +628,7 @@ let frontendSection = fn(
 			b.statement(if (fe.mode == .http) "option httplog" else "option tcplog"),
 			if (fe.timeoutClientMs != nil)
 				b.statement("timeout client {fe.timeoutClientMs}"),
+			in forwardedHeaders(fe),
 			for (d in myDropped)
 				let reason = Str.join(d.errors, "; ");
 				b.comment("dropped be-{d.rule.hash}: {reason}"),
@@ -1162,6 +1179,64 @@ Test.group(
 				Test.expect(config.frontends["alt"]?.publicPort).toEqual(8443),
 		);
 		Test.it(
+			"tells the backend of a terminating http frontend the request was https",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testTlsFe("https", 443, .http)],
+					rules: [],
+				});
+				Test.expect([
+					for (l in lines(config.frontends["https"]?.statements))
+						if (Str.startsWith(l, "http-request"))
+							l,
+				]).toEqual([
+					"http-request set-header X-Forwarded-Proto https",
+					"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+					"http-request set-header X-Forwarded-For %[src]",
+				]),
+		);
+		Test.it(
+			"tells the backend of a plain http frontend the request was http",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("http", 80, .http)],
+					rules: [],
+				});
+				Test.expect([
+					for (l in lines(config.frontends["http"]?.statements))
+						if (Str.startsWith(l, "http-request"))
+							l,
+				]).toEqual([
+					"http-request set-header X-Forwarded-Proto http",
+					"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+					"http-request set-header X-Forwarded-For %[src]",
+				]),
+		);
+		Test.it(
+			"sets no headers on tcp frontends, plain or terminating",
+			fn()
+				let config = buildConfig({
+					version: "3.4",
+					timeouts: defaultTimeouts,
+					frontends: [testFe("raw", 5432, .tcp), testTlsFe("tls", 443, .tcp)],
+					rules: [],
+				});
+				Test.expect([
+					for (l in lines(config.frontends["raw"]?.statements))
+						if (Str.startsWith(l, "http-request"))
+							l,
+				]).toEqual([] as [Str]);
+				Test.expect([
+					for (l in lines(config.frontends["tls"]?.statements))
+						if (Str.startsWith(l, "http-request"))
+							l,
+				]).toEqual([] as [Str]),
+		);
+		Test.it(
 			"publishes no port for a frontend that is not public",
 			fn()
 				let config = buildConfig({
@@ -1183,7 +1258,7 @@ Test.group(
 					rules: [],
 				});
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind :::30080 v4v6 mss 1220\n\tmode http\n\toption httplog\n",
+					"global\n\tlog stdout format raw local0 info\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend http\n\tbind :::30080 v4v6 mss 1220\n\tmode http\n\toption httplog\n\thttp-request set-header X-Forwarded-Proto http\n\thttp-request set-header X-Forwarded-Host %[req.hdr(host)]\n\thttp-request set-header X-Forwarded-For %[src]\n",
 				),
 		);
 		Test.it(
@@ -1198,6 +1273,9 @@ Test.group(
 				Test.expect(lines(config.frontends["http"]?.statements)).toEqual([
 					"mode http",
 					"option httplog",
+					"http-request set-header X-Forwarded-Proto http",
+					"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+					"http-request set-header X-Forwarded-For %[src]",
 					"acl m-r1-0 req.hdr(host),host_only -i -m str example.com",
 					"acl m-r1-1 path -m str /api",
 					"acl m-r1-1 path_beg /api/",
@@ -1216,6 +1294,9 @@ Test.group(
 				Test.expect(lines(config.frontends["http"]?.statements)).toEqual([
 					"mode http",
 					"option httplog",
+					"http-request set-header X-Forwarded-Proto http",
+					"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+					"http-request set-header X-Forwarded-For %[src]",
 					"acl m-r1-0 path_beg /",
 					"use_backend be-r1 if m-r1-0",
 				]),
@@ -1258,7 +1339,7 @@ Test.group(
 					"h2,http/1.1",
 				]);
 				Test.expect(HAProxy.formatConfig({ sections: HAProxy.configSections(config) })).toEqual(
-					"global\n\tlog stdout format raw local0 info\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind :::30443 v4v6 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
+					"global\n\tlog stdout format raw local0 info\n\nresolvers internal\n\tparse-resolv-conf\n\ndefaults\n\tlog global\n\tdefault-server inter 2s fall 3 rise 2 resolvers internal init-addr last,none\n\ttimeout connect 5000\n\ttimeout client 30000\n\ttimeout server 30000\n\nfrontend https\n\tbind :::30443 v4v6 mss 1220 ssl crt-list /usr/local/etc/haproxy/tls/https.list strict-sni alpn h2,http/1.1\n\tmode http\n\toption httplog\n\thttp-request set-header X-Forwarded-Proto https\n\thttp-request set-header X-Forwarded-Host %[req.hdr(host)]\n\thttp-request set-header X-Forwarded-For %[src]\n\tacl m-r1-0 req.hdr(host),host_only -i -m str example.com\n\tuse_backend be-r1 if m-r1-0\n\nbackend be-r1\n\tmode http\n\tserver server1 10.0.0.1:8080 check inter 2000\n",
 				),
 		);
 		Test.it(
@@ -1411,6 +1492,9 @@ Test.group(
 				Test.expect(lines(config.frontends["https"]?.statements)).toEqual([
 					"mode http",
 					"option httplog",
+					"http-request set-header X-Forwarded-Proto https",
+					"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+					"http-request set-header X-Forwarded-For %[src]",
 					"acl m-r1-0 ssl_fc_sni -i db.example.com",
 					"use_backend be-r1 if m-r1-0",
 				]),
@@ -1655,6 +1739,9 @@ Test.group(
 					"mode http",
 					"option httplog",
 					"timeout client 3600000",
+					"http-request set-header X-Forwarded-Proto http",
+					"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+					"http-request set-header X-Forwarded-For %[src]",
 				]),
 		),
 )
