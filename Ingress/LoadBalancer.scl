@@ -363,6 +363,10 @@ let redirectPort = fn(frontends: #{Str: FrontendOptions}, from: Str, to: Str)
 		raise InvalidOptions("redirect target {to} must be a TLS-terminating HTTP frontend")
 	else if ((source.public ?? true) && !(dest.public ?? true))
 		raise InvalidOptions("public frontend {from} cannot redirect to non-public frontend {to}")
+	else if (!(source.public ?? true) && dest.port < unprivilegedPortStart)
+		raise InvalidOptions(
+			"non-public frontend {from} cannot redirect to frontend {to} on port {dest.port}: destination ports below {unprivilegedPortStart} are reachable only through the public gateway",
+		)
 	else
 		dest.port
 
@@ -2064,6 +2068,17 @@ Test.group(
 				).toEqual("public frontend http cannot redirect to non-public frontend https"),
 		);
 		Test.it(
+			"rejects a private source redirecting to a privileged destination port",
+			fn()
+				Test.expect(
+					try redirect({ port: 8080, mode: .http, public: false }, target, pair);
+						"accepted"
+					catch InvalidOptions(message): message,
+				).toEqual(
+					"non-public frontend http cannot redirect to frontend https on port 443: destination ports below 1024 are reachable only through the public gateway",
+				),
+		);
+		Test.it(
 			"accepts a TLS rule on the destination but no rule on the source",
 			fn()
 				let ingress = redirect(source, target, pair);
@@ -2110,9 +2125,16 @@ Test.it(
 		]);
 		Test.expect(comments(source)).toEqual(["dropped be-stale: {noRedirectRules}"]);
 		Test.expect(Dict.keys(config.backends)).toEqual(["be-live"]);
-		Test.expect(useBackends(config.frontends["https"]?.statements)).toEqual([
-			"use_backend be-live if m-live-0",
+		let target = config.frontends["https"]?.statements;
+		Test.expect([
+			for (line in lines(target))
+				if (Str.startsWith(line, "http-request set-header X-Forwarded-")) line,
+		]).toEqual([
+			"http-request set-header X-Forwarded-Proto https",
+			"http-request set-header X-Forwarded-Host %[req.hdr(host)]",
+			"http-request set-header X-Forwarded-For %[src]",
 		]);
+		Test.expect(useBackends(target)).toEqual(["use_backend be-live if m-live-0"]);
 		Test.expect(Dict.keys(config.certificates ?? #{})).toEqual(["cert-live"]),
 )
 

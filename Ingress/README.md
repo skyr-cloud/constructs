@@ -53,9 +53,11 @@ therefore has to be 1024 or above.
 
 To redirect requests from port 80 to HTTPS, set the optional `redirects`
 dict alongside `frontends` in `LoadBalancer.Proxy`. Each entry maps a cleartext
-HTTP frontend to a TLS-terminating HTTP frontend in the same proxy. Use the frontend names as
-strings, even when the keys in `frontends` are atoms. If the source is public,
-its destination must also be public.
+HTTP frontend to a TLS-terminating HTTP frontend in the same proxy. Use the
+frontend names as strings, even when the keys in `frontends` are atoms. If the
+source is public, its destination must also be public. If the source is private
+(`public: false`), the destination port must be 1024 or above: the redirect keeps
+the hostname, and ports below 1024 are only exposed through the public gateway.
 
 ```scl
 frontends: #{
