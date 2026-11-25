@@ -49,6 +49,32 @@ A frontend with `public: false` is published on no gateway. It answers on the
 replicas' own addresses on the ingress network, on its `port` as written — which
 therefore has to be 1024 or above.
 
+### Redirect HTTP to HTTPS
+
+To redirect requests from port 80 to HTTPS, set the optional `redirects`
+dict alongside `frontends` in `LoadBalancer.Proxy`. Each entry maps a cleartext
+HTTP frontend to a TLS-terminating HTTP frontend in the same proxy. Use the
+frontend names as strings, even when the keys in `frontends` are atoms. If the
+source is public, its destination must also be public. If the source is private
+(`public: false`), the destination port must be 1024 or above: the redirect keeps
+the hostname, and ports below 1024 are only exposed through the public gateway.
+
+```scl
+frontends: #{
+	.http: { port: 80, mode: .http },
+	.https: { port: 443, mode: .http, tls: .terminate },
+},
+redirects: #{ "http": "https" },
+```
+
+`http://example.com/shows?month=may` now receives a `301 Moved Permanently` to
+`https://example.com/shows?month=may`. The hostname, path and query come from
+the request. A request without a `Host` header receives `400 Bad Request`.
+A non-default destination port is included (`:8443`, for example).
+There is no hostname or path filter: put the rules and their certificates on
+`.https`, not on the redirecting frontend. Without `redirects`, routing is
+unchanged.
+
 ### Backends
 
 A replica reaches a backend over the ingress network, so a backend needs a NIC
